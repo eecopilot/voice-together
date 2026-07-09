@@ -1,0 +1,28 @@
+# Runtime data
+backend/data/
+.venv/
+*.db
+*.sqlite
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Go
+backend/bin/
+backend/tmp/
+backend/server
+
+# OS/editor
+.DS_Store
+._*
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
