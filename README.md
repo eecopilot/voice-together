@@ -26,7 +26,7 @@ The project installs `ffmpeg` and `faster-whisper` into a local `.venv` with `sc
 ```bash
 cd ~/myproject/voice-together
 scripts/setup-tools.sh
-scripts/start.sh
+./start.sh
 ```
 
 Then open:
@@ -37,10 +37,26 @@ http://192.168.1.30:8788
 
 For the existing sample file, click `导入 demo.mp4`.
 
+Useful commands:
+
+```bash
+./start.sh status
+./start.sh logs
+./start.sh restart
+./start.sh stop
+```
+
+The React frontend is embedded into the Go binary during `./start.sh build`, so the built server does not need `frontend/dist` at runtime:
+
+```bash
+backend/bin/voice-together -root "$PWD"
+```
+
 ## Development Notes
 
 - Backend: `backend/cmd/server`
 - Frontend: `frontend/src`
+- Embedded frontend source: `backend/internal/web`
 - Runtime data: `backend/data`
 - Extracted browser audio: `backend/data/clips/<clip-id>/audio.mp3`
 - Transcription WAV: `backend/data/clips/<clip-id>/transcribe.wav`

@@ -15,6 +15,7 @@ import (
 	"voice-together/backend/internal/media"
 	"voice-together/backend/internal/storage"
 	"voice-together/backend/internal/transcribe"
+	"voice-together/backend/internal/web"
 )
 
 func main() {
@@ -38,7 +39,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              *addr,
-		Handler:           api.New(store, paths, media.New(paths.ProjectRoot), transcribe.New(paths.ProjectRoot)).Routes(),
+		Handler:           api.New(store, paths, media.New(paths.ProjectRoot), transcribe.New(paths.ProjectRoot), web.Dist()).Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

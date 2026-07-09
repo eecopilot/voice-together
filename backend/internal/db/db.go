@@ -139,7 +139,7 @@ func (s *Store) ListClips(ctx context.Context) ([]Clip, error) {
 	}
 	defer rows.Close()
 
-	var clips []Clip
+	clips := []Clip{}
 	for rows.Next() {
 		clip, err := scanClip(rows)
 		if err != nil {
@@ -183,7 +183,7 @@ func (s *Store) ListSegments(ctx context.Context, clipID string) ([]Segment, err
 	}
 	defer rows.Close()
 
-	var segments []Segment
+	segments := []Segment{}
 	for rows.Next() {
 		var segment Segment
 		if err := rows.Scan(&segment.ID, &segment.ClipID, &segment.Start, &segment.End, &segment.Text); err != nil {

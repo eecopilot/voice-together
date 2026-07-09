@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ type Server struct {
 	paths      storage.Paths
 	media      media.Processor
 	transcribe transcribe.Service
+	staticFS   fs.FS
 }
 
 type clipResponse struct {
@@ -34,12 +37,13 @@ type clipResponse struct {
 	Segments []db.Segment `json:"segments"`
 }
 
-func New(store *db.Store, paths storage.Paths, mediaProcessor media.Processor, transcriber transcribe.Service) *Server {
+func New(store *db.Store, paths storage.Paths, mediaProcessor media.Processor, transcriber transcribe.Service, staticFS fs.FS) *Server {
 	return &Server{
 		store:      store,
 		paths:      paths,
 		media:      mediaProcessor,
 		transcribe: transcriber,
+		staticFS:   staticFS,
 	}
 }
 
@@ -196,7 +200,13 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request, clipID stri
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	if s.staticFS != nil && s.paths.WebDir == "" {
+		s.handleEmbeddedStatic(w, r)
+		return
+	}
+
 	if r.URL.Path == "/" {
+		setIndexCacheHeader(w)
 		http.ServeFile(w, r, filepath.Join(s.paths.WebDir, "index.html"))
 		return
 	}
@@ -208,10 +218,56 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+		setStaticCacheHeader(w, filepath.ToSlash(requestedPath))
 		http.ServeFile(w, r, fullPath)
 		return
 	}
+	if isStaticAssetPath(filepath.ToSlash(requestedPath)) {
+		http.NotFound(w, r)
+		return
+	}
+	setIndexCacheHeader(w)
 	http.ServeFile(w, r, filepath.Join(s.paths.WebDir, "index.html"))
+}
+
+func (s *Server) handleEmbeddedStatic(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		setIndexCacheHeader(w)
+		http.ServeFileFS(w, r, s.staticFS, "index.html")
+		return
+	}
+
+	requestedPath := path.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+	if requestedPath == "." || strings.HasPrefix(requestedPath, "../") || strings.HasPrefix(requestedPath, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	if info, err := fs.Stat(s.staticFS, requestedPath); err == nil && !info.IsDir() {
+		setStaticCacheHeader(w, requestedPath)
+		http.ServeFileFS(w, r, s.staticFS, requestedPath)
+		return
+	}
+	if isStaticAssetPath(requestedPath) {
+		http.NotFound(w, r)
+		return
+	}
+	setIndexCacheHeader(w)
+	http.ServeFileFS(w, r, s.staticFS, "index.html")
+}
+
+func isStaticAssetPath(requestedPath string) bool {
+	return strings.HasPrefix(requestedPath, "assets/") || path.Ext(requestedPath) != ""
+}
+
+func setIndexCacheHeader(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-cache")
+}
+
+func setStaticCacheHeader(w http.ResponseWriter, requestedPath string) {
+	if strings.HasPrefix(requestedPath, "assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
 }
 
 func (s *Server) importMultipart(ctx context.Context, file multipart.File, header *multipart.FileHeader, title string, language string) (clipResponse, error) {

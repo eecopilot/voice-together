@@ -20,7 +20,8 @@ function App() {
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
 
-  const selectedSegment = selectedIndex === null ? null : detail?.segments[selectedIndex] ?? null
+  const segments = detail?.segments ?? []
+  const selectedSegment = selectedIndex === null ? null : segments[selectedIndex] ?? null
   const audioSource = detail?.clip.status === 'ready' ? `/api/clips/${detail.clip.id}/audio` : ''
 
   useEffect(() => {
@@ -34,7 +35,7 @@ function App() {
   }, [speed])
 
   const activeOrSelectedIndex = activeIndex ?? selectedIndex
-  const totalSegments = detail?.segments.length ?? 0
+  const totalSegments = segments.length
   const readyClips = useMemo(() => clips.filter((clip) => clip.status === 'ready').length, [clips])
 
   async function refreshClips() {
@@ -42,7 +43,8 @@ function App() {
       const next = await listClips()
       setClips(next)
       if (!detail && next.length > 0) {
-        await openClip(next[0].id)
+        const preferredClip = next.find((clip) => clip.status === 'ready') ?? next[0]
+        await openClip(preferredClip.id)
       }
     } catch (err) {
       setError(errorMessage(err))
@@ -51,7 +53,7 @@ function App() {
 
   async function openClip(id: string) {
     setError('')
-    const next = await getClip(id)
+    const next = normalizeDetail(await getClip(id))
     setDetail(next)
     setSelectedIndex(next.segments.length > 0 ? 0 : null)
     setActiveIndex(null)
@@ -68,7 +70,7 @@ function App() {
     setError('')
     try {
       const title = file.name.replace(/\.[^.]+$/, '')
-      const next = await uploadClip(file, title)
+      const next = normalizeDetail(await uploadClip(file, title))
       setDetail(next)
       setSelectedIndex(next.segments.length > 0 ? 0 : null)
       setFile(null)
@@ -84,7 +86,7 @@ function App() {
     setBusy('demo')
     setError('')
     try {
-      const next = await importDemo()
+      const next = normalizeDetail(await importDemo())
       setDetail(next)
       setSelectedIndex(next.segments.length > 0 ? 0 : null)
       await refreshClips()
@@ -118,7 +120,7 @@ function App() {
   }
 
   function playSegment(index: number) {
-    const segment = detail?.segments[index]
+    const segment = segments[index]
     const audio = audioRef.current
     if (!segment || !audio) {
       return
@@ -130,7 +132,7 @@ function App() {
   }
 
   function previousSegment() {
-    if (!detail || detail.segments.length === 0) {
+    if (!detail || segments.length === 0) {
       return
     }
     const nextIndex = Math.max(0, (selectedIndex ?? activeIndex ?? 0) - 1)
@@ -138,10 +140,10 @@ function App() {
   }
 
   function nextSegment() {
-    if (!detail || detail.segments.length === 0) {
+    if (!detail || segments.length === 0) {
       return
     }
-    const nextIndex = Math.min(detail.segments.length - 1, (selectedIndex ?? activeIndex ?? 0) + 1)
+    const nextIndex = Math.min(segments.length - 1, (selectedIndex ?? activeIndex ?? 0) + 1)
     playSegment(nextIndex)
   }
 
@@ -166,7 +168,7 @@ function App() {
       return
     }
     const current = audio.currentTime
-    const index = detail.segments.findIndex((segment) => current >= segment.start && current < segment.end)
+    const index = segments.findIndex((segment) => current >= segment.start && current < segment.end)
     setActiveIndex(index === -1 ? null : index)
 
     if (loop && selectedSegment && current >= selectedSegment.end) {
@@ -328,11 +330,11 @@ function App() {
             <CardBody className="max-h-[58vh] overflow-y-auto p-0">
               {!detail ? (
                 <p className="px-5 py-8 text-sm text-muted">暂无字幕。</p>
-              ) : detail.segments.length === 0 ? (
+              ) : segments.length === 0 ? (
                 <p className="px-5 py-8 text-sm text-muted">没有识别到字幕。</p>
               ) : (
                 <div className="divide-y divide-border">
-                  {detail.segments.map((segment, index) => (
+                  {segments.map((segment, index) => (
                     <button
                       key={`${segment.start}-${index}`}
                       type="button"
@@ -360,6 +362,13 @@ function App() {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : '操作失败'
+}
+
+function normalizeDetail(detail: ClipDetail): ClipDetail {
+  return {
+    ...detail,
+    segments: Array.isArray(detail.segments) ? detail.segments : []
+  }
 }
 
 export default App

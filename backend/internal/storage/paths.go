@@ -16,7 +16,7 @@ type Paths struct {
 
 func New(projectRoot string) Paths {
 	dataDir := envOrDefault("VOICE_TOGETHER_DATA_DIR", filepath.Join(projectRoot, "backend", "data"))
-	webDir := envOrDefault("VOICE_TOGETHER_WEB_DIR", filepath.Join(projectRoot, "frontend", "dist"))
+	webDir := os.Getenv("VOICE_TOGETHER_WEB_DIR")
 	return Paths{
 		ProjectRoot: projectRoot,
 		DataDir:     dataDir,
