@@ -18,7 +18,7 @@ export function Button({ className, variant = 'secondary', ...props }: ButtonPro
   return (
     <button
       className={cn(
-        'inline-flex h-10 items-center justify-center gap-2 rounded-md px-4 text-sm font-semibold transition disabled:pointer-events-none disabled:opacity-50',
+        'inline-flex h-10 items-center justify-center gap-2 rounded-md px-4 text-sm font-semibold transition disabled:pointer-events-none disabled:opacity-50 [&>svg]:h-4 [&>svg]:w-4 [&>svg]:shrink-0',
         variants[variant],
         className
       )}

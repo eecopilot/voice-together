@@ -2,6 +2,7 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 're
 import { Headphones, Loader2, MoreVertical, Pause, Play, RefreshCw, Repeat, Search, SkipBack, SkipForward, Trash2, Upload } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Card, CardBody, CardHeader } from './components/ui/card'
+import { Select } from './components/ui/select'
 import { deleteClip, getClip, listClips, reprocessClip, uploadClip } from './lib/api'
 import { cn, formatTime } from './lib/utils'
 import type { Clip, ClipDetail } from './types'
@@ -29,7 +30,6 @@ function App() {
   const [clips, setClips] = useState<Clip[]>([])
   const [detail, setDetail] = useState<ClipDetail | null>(null)
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
-  const [activeIndex, setActiveIndex] = useState<number | null>(null)
   const [loop, setLoop] = useState(true)
   const [speed, setSpeed] = useState(1)
   const [file, setFile] = useState<File | null>(null)
@@ -40,10 +40,14 @@ function App() {
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
   const [clipQuery, setClipQuery] = useState('')
   const [clipFilter, setClipFilter] = useState<ClipFilter>('all')
+  const [currentTime, setCurrentTime] = useState(0)
+  const [duration, setDuration] = useState(0)
 
   const segments = detail?.segments ?? []
-  const selectedSegment = selectedIndex === null ? null : segments[selectedIndex] ?? null
   const audioSource = detail?.clip.status === 'ready' ? `/api/clips/${detail.clip.id}/audio` : ''
+  const effectiveDuration = duration || detail?.clip.duration || 0
+  const seekValue = effectiveDuration > 0 ? Math.min(currentTime, effectiveDuration) : 0
+  const progressPercent = effectiveDuration > 0 ? (seekValue / effectiveDuration) * 100 : 0
 
   useEffect(() => {
     refreshClips()
@@ -55,7 +59,10 @@ function App() {
     }
   }, [speed])
 
-  const activeOrSelectedIndex = activeIndex ?? selectedIndex
+  const playbackIndex = findSegmentIndex(segments, currentTime)
+  const currentIndex = playbackIndex ?? selectedIndex
+  const currentSegment = currentIndex === null ? null : segments[currentIndex] ?? null
+  const loopSegment = selectedIndex === null ? currentSegment : segments[selectedIndex] ?? currentSegment
   const totalSegments = segments.length
   const readyClips = useMemo(() => clips.filter((clip) => clip.status === 'ready').length, [clips])
   const clipStats = useMemo(
@@ -104,10 +111,10 @@ function App() {
     setNotice('')
     setOpenMenuId(null)
     setIsPlaying(false)
+    resetPlaybackState()
     const next = normalizeDetail(await getClip(id))
     setDetail(next)
     setSelectedIndex(next.segments.length > 0 ? 0 : null)
-    setActiveIndex(null)
   }
 
   async function handleUpload(event: FormEvent) {
@@ -126,6 +133,7 @@ function App() {
       setDetail(next)
       setSelectedIndex(next.segments.length > 0 ? 0 : null)
       setIsPlaying(false)
+      resetPlaybackState()
       setFile(null)
       setNotice(next.reused ? '这个文件已经在片段库中，已打开已有片段。' : '')
       await refreshClips()
@@ -146,6 +154,7 @@ function App() {
       setDetail(next)
       setSelectedIndex(next.segments.length > 0 ? 0 : null)
       setIsPlaying(false)
+      resetPlaybackState()
       setNotice('已重新完成转写。')
       await refreshClips()
     } catch (err) {
@@ -165,8 +174,8 @@ function App() {
       if (detail?.clip.id === id) {
         setDetail(null)
         setSelectedIndex(null)
-        setActiveIndex(null)
         setIsPlaying(false)
+        resetPlaybackState()
       }
       await refreshClips()
     } catch (err) {
@@ -188,8 +197,8 @@ function App() {
       return
     }
     setSelectedIndex(index)
-    setActiveIndex(index)
     audio.currentTime = segment.start
+    setCurrentTime(segment.start)
     void audio.play()
   }
 
@@ -197,7 +206,7 @@ function App() {
     if (!detail || segments.length === 0) {
       return
     }
-    const nextIndex = Math.max(0, (selectedIndex ?? activeIndex ?? 0) - 1)
+    const nextIndex = Math.max(0, (currentIndex ?? 0) - 1)
     playSegment(nextIndex)
   }
 
@@ -205,7 +214,7 @@ function App() {
     if (!detail || segments.length === 0) {
       return
     }
-    const nextIndex = Math.min(segments.length - 1, (selectedIndex ?? activeIndex ?? 0) + 1)
+    const nextIndex = Math.min(segments.length - 1, (currentIndex ?? 0) + 1)
     playSegment(nextIndex)
   }
 
@@ -227,13 +236,41 @@ function App() {
       return
     }
     const current = audio.currentTime
-    const index = segments.findIndex((segment) => current >= segment.start && current < segment.end)
-    setActiveIndex(index === -1 ? null : index)
-
-    if (loop && selectedSegment && current >= selectedSegment.end) {
-      audio.currentTime = selectedSegment.start
+    if (loop && loopSegment && current >= loopSegment.end) {
+      audio.currentTime = loopSegment.start
+      setCurrentTime(loopSegment.start)
       void audio.play()
+      return
     }
+
+    setCurrentTime(current)
+  }
+
+  function handleLoadedMetadata() {
+    const audio = audioRef.current
+    if (!audio) {
+      return
+    }
+    setDuration(Number.isFinite(audio.duration) ? audio.duration : 0)
+    setCurrentTime(audio.currentTime)
+  }
+
+  function handleSeek(value: number) {
+    const audio = audioRef.current
+    if (!audio) {
+      return
+    }
+    audio.currentTime = value
+    setCurrentTime(value)
+    const index = findSegmentIndex(segments, value)
+    if (index !== null) {
+      setSelectedIndex(index)
+    }
+  }
+
+  function resetPlaybackState() {
+    setCurrentTime(0)
+    setDuration(0)
   }
 
   return (
@@ -399,9 +436,9 @@ function App() {
                     {detail ? `${totalSegments} 句字幕 · ${detail.clip.language || 'auto'}` : '上传文件后，会在这里同步播放语音和字幕。'}
                   </p>
                 </div>
-                {selectedSegment ? (
+                {currentSegment ? (
                   <span className="rounded-md bg-orange-50 px-3 py-2 text-sm font-semibold text-orange-700">
-                    {formatTime(selectedSegment.start)} - {formatTime(selectedSegment.end)}
+                    {formatTime(currentSegment.start)} - {formatTime(currentSegment.end)}
                   </span>
                 ) : null}
               </div>
@@ -412,43 +449,73 @@ function App() {
               ) : null}
               <audio
                 ref={audioRef}
-                className="w-full"
+                className="hidden"
                 src={audioSource}
-                controls
                 preload="metadata"
+                onLoadedMetadata={handleLoadedMetadata}
                 onTimeUpdate={handleTimeUpdate}
                 onPlay={() => setIsPlaying(true)}
                 onPause={() => setIsPlaying(false)}
                 onEnded={() => setIsPlaying(false)}
               />
-              <div className="flex flex-wrap items-center gap-2">
-                <Button type="button" onClick={togglePlay} disabled={!audioSource}>
-                  {isPlaying ? <Pause size={16} /> : <Play size={16} />}
-                  {isPlaying ? '暂停' : '播放'}
-                </Button>
-                <Button type="button" onClick={previousSegment} disabled={!audioSource || segments.length === 0}>
-                  <SkipBack size={16} />
-                  上一句
-                </Button>
-                <Button type="button" onClick={nextSegment} disabled={!audioSource || segments.length === 0}>
-                  下一句
-                  <SkipForward size={16} />
-                </Button>
-                <Button type="button" variant={loop ? 'primary' : 'secondary'} onClick={() => setLoop(!loop)}>
-                  <Repeat size={16} />
-                  {loop ? '循环当前句' : '不循环'}
-                </Button>
-                <select
-                  className="h-10 rounded-md border border-border bg-white px-3 text-sm font-semibold"
-                  value={speed}
-                  onChange={(event) => setSpeed(Number(event.target.value))}
-                >
-                  {speeds.map((value) => (
-                    <option key={value} value={value}>
-                      {value}x
-                    </option>
-                  ))}
-                </select>
+              <div className="grid gap-3 rounded-lg bg-slate-50/90 p-3 sm:p-4">
+                <div className="grid min-w-0 gap-1.5">
+                  <div className="flex items-center justify-between gap-3 text-xs font-semibold text-muted">
+                    <span className="font-mono">{formatTime(seekValue)}</span>
+                    <span className="font-mono">{formatTime(effectiveDuration)}</span>
+                  </div>
+                  <input
+                    className="player-range"
+                    type="range"
+                    min={0}
+                    max={Math.max(effectiveDuration, 0)}
+                    step={0.05}
+                    value={seekValue}
+                    onChange={(event) => handleSeek(Number(event.target.value))}
+                    disabled={!audioSource || effectiveDuration <= 0}
+                    style={{
+                      background: `linear-gradient(to right, #0f766e 0%, #0f766e ${progressPercent}%, #cbd5e1 ${progressPercent}%, #cbd5e1 100%)`
+                    }}
+                    aria-label="播放进度"
+                  />
+                </div>
+
+                {currentSegment ? (
+                  <div className="rounded-md border border-teal-100 bg-white px-3 py-2.5 sm:px-4 sm:py-3">
+                    <p className="text-base font-semibold leading-7 text-slate-950">{currentSegment.text}</p>
+                  </div>
+                ) : null}
+
+                <div className="grid grid-cols-[48px_48px_48px_48px_48px] items-center gap-2 md:flex md:flex-wrap">
+                  <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" onClick={previousSegment} disabled={!audioSource || segments.length === 0} aria-label="上一句">
+                    <SkipBack size={16} />
+                    <span className="hidden md:inline">上一句</span>
+                  </Button>
+                  <Button className="h-10 w-full rounded-full px-0 md:w-auto md:px-4" variant="primary" type="button" onClick={togglePlay} disabled={!audioSource} aria-label={isPlaying ? '暂停' : '播放'}>
+                    {isPlaying ? <Pause size={16} /> : <Play size={16} />}
+                    <span className="hidden md:inline">{isPlaying ? '暂停' : '播放'}</span>
+                  </Button>
+                  <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" onClick={nextSegment} disabled={!audioSource || segments.length === 0} aria-label="下一句">
+                    <span className="hidden md:inline">下一句</span>
+                    <SkipForward size={16} />
+                  </Button>
+                  <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" variant={loop ? 'primary' : 'secondary'} onClick={() => setLoop(!loop)} aria-label={loop ? '循环当前句' : '不循环'}>
+                    <Repeat size={16} />
+                    <span className="hidden md:inline">{loop ? '循环当前句' : '不循环'}</span>
+                  </Button>
+                  <Select
+                    className="w-full md:w-20"
+                    value={speed}
+                    onChange={(event) => setSpeed(Number(event.target.value))}
+                    aria-label="播放速度"
+                  >
+                    {speeds.map((value) => (
+                      <option key={value} value={value}>
+                        {value}x
+                      </option>
+                    ))}
+                  </Select>
+                </div>
               </div>
             </CardBody>
           </Card>
@@ -469,13 +536,13 @@ function App() {
                       key={`${segment.start}-${index}`}
                       type="button"
                       className={cn(
-                        'grid w-full grid-cols-[72px_1fr] gap-3 px-5 py-4 text-left transition',
-                        activeOrSelectedIndex === index ? 'bg-teal-50' : 'hover:bg-slate-50'
+                        'grid w-full grid-cols-[76px_minmax(0,1fr)] items-start gap-4 px-4 py-4 text-left transition sm:grid-cols-[92px_minmax(0,1fr)] sm:px-5',
+                        currentIndex === index ? 'bg-teal-50' : 'hover:bg-slate-50'
                       )}
                       onClick={() => playSegment(index)}
                     >
-                      <span className="font-mono text-xs text-muted">{formatTime(segment.start)}</span>
-                      <span className={cn('text-base leading-7', activeOrSelectedIndex === index ? 'font-semibold text-primary' : 'text-slate-800')}>
+                      <span className="pt-1 font-mono text-xs font-semibold tabular-nums text-muted">{formatTime(segment.start)}</span>
+                      <span className={cn('min-w-0 text-base leading-7', currentIndex === index ? 'font-semibold text-primary' : 'text-slate-800')}>
                         {segment.text}
                       </span>
                     </button>
@@ -505,6 +572,14 @@ function formatClipDate(value: string) {
     hour: '2-digit',
     minute: '2-digit'
   }).format(date)
+}
+
+function findSegmentIndex(segments: ClipDetail['segments'], time: number) {
+  if (!Number.isFinite(time)) {
+    return null
+  }
+  const index = segments.findIndex((segment) => time >= segment.start && time < segment.end)
+  return index === -1 ? null : index
 }
 
 function normalizeDetail(detail: ClipDetail): ClipDetail {
