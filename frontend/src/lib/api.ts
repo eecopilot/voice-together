@@ -36,6 +36,11 @@ export async function importDemo(): Promise<ClipDetail> {
   return readJSON<ClipDetail>(response)
 }
 
+export async function reprocessClip(id: string): Promise<ClipDetail> {
+  const response = await fetch(`/api/clips/${id}/reprocess`, { method: 'POST' })
+  return readJSON<ClipDetail>(response)
+}
+
 export async function deleteClip(id: string): Promise<void> {
   const response = await fetch(`/api/clips/${id}`, { method: 'DELETE' })
   await readJSON(response)

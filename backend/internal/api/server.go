@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -35,6 +36,7 @@ type Server struct {
 type clipResponse struct {
 	Clip     db.Clip      `json:"clip"`
 	Segments []db.Segment `json:"segments"`
+	Reused   bool         `json:"reused,omitempty"`
 }
 
 func New(store *db.Store, paths storage.Paths, mediaProcessor media.Processor, transcriber transcribe.Service, staticFS fs.FS) *Server {
@@ -109,7 +111,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, response)
+	status := http.StatusCreated
+	if response.Reused {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, response)
 }
 
 func (s *Server) handleDemoImport(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +135,11 @@ func (s *Server) handleDemoImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, response)
+	status := http.StatusCreated
+	if response.Reused {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, response)
 }
 
 func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
@@ -147,6 +157,15 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleAudio(w, r, clipID)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "reprocess" {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		s.handleReprocess(w, r, clipID)
 		return
 	}
 
@@ -180,6 +199,40 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request, clipID string) {
+	clip, _, err := s.store.GetClip(r.Context(), clipID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("clip not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if clip.SourcePath == "" {
+		writeError(w, http.StatusBadRequest, errors.New("clip source is missing"))
+		return
+	}
+	if _, err := os.Stat(clip.SourcePath); err != nil {
+		writeError(w, http.StatusNotFound, fmt.Errorf("clip source not found: %w", err))
+		return
+	}
+
+	if clip.SourceHash == "" {
+		if sourceHash, err := hashFile(clip.SourcePath); err == nil {
+			clip.SourceHash = sourceHash
+			_ = s.store.UpdateClipSourceHash(r.Context(), clip.ID, sourceHash)
+		}
+	}
+
+	response, err := s.processExistingSource(r.Context(), clip.ID, clip.SourcePath, clip.Language)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request, clipID string) {
@@ -274,10 +327,19 @@ func (s *Server) importMultipart(ctx context.Context, file multipart.File, heade
 	id := newID()
 	ext := safeExt(header.Filename)
 	sourcePath := filepath.Join(s.paths.UploadsDir, id+ext)
-	if err := writeFile(sourcePath, file); err != nil {
+	sourceHash, err := writeFileAndHash(sourcePath, file)
+	if err != nil {
 		return clipResponse{}, err
 	}
-	return s.processSource(ctx, id, title, sourcePath, language)
+	if existing, ok, err := s.findExistingByHash(ctx, sourceHash); err != nil {
+		_ = os.Remove(sourcePath)
+		return clipResponse{}, err
+	} else if ok {
+		_ = os.Remove(sourcePath)
+		existing.Reused = true
+		return existing, nil
+	}
+	return s.processSource(ctx, id, title, sourcePath, sourceHash, language)
 }
 
 func (s *Server) importLocalFile(ctx context.Context, sourcePath string, title string, language string) (clipResponse, error) {
@@ -289,18 +351,28 @@ func (s *Server) importLocalFile(ctx context.Context, sourcePath string, title s
 		return clipResponse{}, err
 	}
 	defer source.Close()
-	if err := writeFile(savedPath, source); err != nil {
+	sourceHash, err := writeFileAndHash(savedPath, source)
+	if err != nil {
 		return clipResponse{}, err
 	}
-	return s.processSource(ctx, id, title, savedPath, language)
+	if existing, ok, err := s.findExistingByHash(ctx, sourceHash); err != nil {
+		_ = os.Remove(savedPath)
+		return clipResponse{}, err
+	} else if ok {
+		_ = os.Remove(savedPath)
+		existing.Reused = true
+		return existing, nil
+	}
+	return s.processSource(ctx, id, title, savedPath, sourceHash, language)
 }
 
-func (s *Server) processSource(ctx context.Context, id string, title string, sourcePath string, language string) (clipResponse, error) {
+func (s *Server) processSource(ctx context.Context, id string, title string, sourcePath string, sourceHash string, language string) (clipResponse, error) {
 	now := time.Now()
 	clip := db.Clip{
 		ID:         id,
 		Title:      title,
 		SourcePath: sourcePath,
+		SourceHash: sourceHash,
 		Language:   language,
 		Status:     "processing",
 		CreatedAt:  now,
@@ -308,8 +380,19 @@ func (s *Server) processSource(ctx context.Context, id string, title string, sou
 	if err := s.store.CreateClip(ctx, clip); err != nil {
 		return clipResponse{}, err
 	}
+	return s.processExistingSource(ctx, id, sourcePath, language)
+}
+
+func (s *Server) processExistingSource(ctx context.Context, id string, sourcePath string, language string) (clipResponse, error) {
+	if err := s.store.MarkClipProcessing(ctx, id); err != nil {
+		return clipResponse{}, err
+	}
+	if err := s.store.ReplaceSegments(ctx, id, []db.Segment{}); err != nil {
+		return clipResponse{}, err
+	}
 
 	clipDir := filepath.Join(s.paths.ClipsDir, id)
+	_ = os.RemoveAll(clipDir)
 	mediaResult, err := s.media.Extract(ctx, sourcePath, clipDir)
 	if err != nil {
 		_ = s.store.UpdateClipProcessed(ctx, id, "", 0, language, "error", err.Error())
@@ -344,6 +427,53 @@ func (s *Server) processSource(ctx context.Context, id string, title string, sou
 	return clipResponse{Clip: readyClip, Segments: segments}, nil
 }
 
+func (s *Server) findExistingByHash(ctx context.Context, sourceHash string) (clipResponse, bool, error) {
+	if sourceHash == "" {
+		return clipResponse{}, false, nil
+	}
+
+	clip, segments, err := s.store.GetClipBySourceHash(ctx, sourceHash)
+	if err == nil {
+		return clipResponse{Clip: clip, Segments: segments}, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return clipResponse{}, false, err
+	}
+
+	clips, err := s.store.ListClips(ctx)
+	if err != nil {
+		return clipResponse{}, false, err
+	}
+	updated := false
+	for _, clip := range clips {
+		if clip.SourceHash != "" || clip.SourcePath == "" {
+			continue
+		}
+		existingHash, err := hashFile(clip.SourcePath)
+		if err != nil {
+			continue
+		}
+		if err := s.store.UpdateClipSourceHash(ctx, clip.ID, existingHash); err != nil {
+			return clipResponse{}, false, err
+		}
+		if existingHash == sourceHash {
+			updated = true
+		}
+	}
+	if !updated {
+		return clipResponse{}, false, nil
+	}
+
+	clip, segments, err = s.store.GetClipBySourceHash(ctx, sourceHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return clipResponse{}, false, nil
+		}
+		return clipResponse{}, false, err
+	}
+	return clipResponse{Clip: clip, Segments: segments}, true, nil
+}
+
 func writeFile(path string, source io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -355,6 +485,37 @@ func writeFile(path string, source io.Reader) error {
 	defer destination.Close()
 	_, err = io.Copy(destination, source)
 	return err
+}
+
+func writeFileAndHash(path string, source io.Reader) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	destination, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer destination.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(destination, hasher), source); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func hashFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func safeExt(filename string) string {

@@ -2,6 +2,7 @@ export type Clip = {
   id: string
   title: string
   source_path: string
+  source_hash: string
   audio_path: string
   duration: number
   language: string
@@ -21,4 +22,5 @@ export type Segment = {
 export type ClipDetail = {
   clip: Clip
   segments: Segment[]
+  reused?: boolean
 }

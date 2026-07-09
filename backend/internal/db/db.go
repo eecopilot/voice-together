@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,7 @@ type Clip struct {
 	ID         string    `json:"id"`
 	Title      string    `json:"title"`
 	SourcePath string    `json:"source_path"`
+	SourceHash string    `json:"source_hash"`
 	AudioPath  string    `json:"audio_path"`
 	Duration   float64   `json:"duration"`
 	Language   string    `json:"language"`
@@ -59,6 +61,7 @@ func (s *Store) init(ctx context.Context) error {
 			id TEXT PRIMARY KEY,
 			title TEXT NOT NULL,
 			source_path TEXT NOT NULL,
+			source_hash TEXT NOT NULL DEFAULT '',
 			audio_path TEXT NOT NULL DEFAULT '',
 			duration REAL NOT NULL DEFAULT 0,
 			language TEXT NOT NULL DEFAULT '',
@@ -82,14 +85,38 @@ func (s *Store) init(ctx context.Context) error {
 			return err
 		}
 	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE clips ADD COLUMN source_hash TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_clips_source_hash ON clips(source_hash)`); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (s *Store) CreateClip(ctx context.Context, clip Clip) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO clips (id, title, source_path, audio_path, duration, language, status, error, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, clip.ID, clip.Title, clip.SourcePath, clip.AudioPath, clip.Duration, clip.Language, clip.Status, clip.Error, clip.CreatedAt.Format(time.RFC3339))
+		INSERT INTO clips (id, title, source_path, source_hash, audio_path, duration, language, status, error, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, clip.ID, clip.Title, clip.SourcePath, clip.SourceHash, clip.AudioPath, clip.Duration, clip.Language, clip.Status, clip.Error, clip.CreatedAt.Format(time.RFC3339))
+	return err
+}
+
+func (s *Store) UpdateClipSourceHash(ctx context.Context, id string, sourceHash string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE clips
+		SET source_hash = ?
+		WHERE id = ?
+	`, sourceHash, id)
+	return err
+}
+
+func (s *Store) MarkClipProcessing(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE clips
+		SET audio_path = '', duration = 0, status = 'processing', error = ''
+		WHERE id = ?
+	`, id)
 	return err
 }
 
@@ -130,7 +157,7 @@ func (s *Store) ReplaceSegments(ctx context.Context, clipID string, segments []S
 
 func (s *Store) ListClips(ctx context.Context) ([]Clip, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, title, source_path, audio_path, duration, language, status, error, created_at
+		SELECT id, title, source_path, source_hash, audio_path, duration, language, status, error, created_at
 		FROM clips
 		ORDER BY created_at DESC
 	`)
@@ -153,9 +180,34 @@ func (s *Store) ListClips(ctx context.Context) ([]Clip, error) {
 	return clips, nil
 }
 
+func (s *Store) GetClipBySourceHash(ctx context.Context, sourceHash string) (Clip, []Segment, error) {
+	if sourceHash == "" {
+		return Clip{}, nil, sql.ErrNoRows
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, title, source_path, source_hash, audio_path, duration, language, status, error, created_at
+		FROM clips
+		WHERE source_hash = ?
+		ORDER BY
+			CASE status WHEN 'ready' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END,
+			created_at DESC
+		LIMIT 1
+	`, sourceHash)
+	clip, err := scanClip(row)
+	if err != nil {
+		return Clip{}, nil, err
+	}
+
+	segments, err := s.ListSegments(ctx, clip.ID)
+	if err != nil {
+		return Clip{}, nil, err
+	}
+	return clip, segments, nil
+}
+
 func (s *Store) GetClip(ctx context.Context, id string) (Clip, []Segment, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, title, source_path, audio_path, duration, language, status, error, created_at
+		SELECT id, title, source_path, source_hash, audio_path, duration, language, status, error, created_at
 		FROM clips
 		WHERE id = ?
 	`, id)
@@ -224,6 +276,7 @@ func scanClip(row scanner) (Clip, error) {
 		&clip.ID,
 		&clip.Title,
 		&clip.SourcePath,
+		&clip.SourceHash,
 		&clip.AudioPath,
 		&clip.Duration,
 		&clip.Language,
