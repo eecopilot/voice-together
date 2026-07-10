@@ -46,6 +46,31 @@ Useful commands:
 ./start.sh stop
 ```
 
+## Development Mode
+
+Start the Go backend with Air reload and the React frontend with Vite hot reload:
+
+```bash
+./start.sh dev
+```
+
+Open the development frontend at:
+
+```text
+http://192.168.1.30:5173
+```
+
+Development lifecycle commands:
+
+```bash
+./start.sh dev-status
+./start.sh dev-logs
+./start.sh dev-restart
+./start.sh dev-stop
+```
+
+Air uses `backend/.air.toml`. The backend listens on port `8788`, and Vite proxies `/api` requests to it.
+
 The React frontend is embedded into the Go binary during `./start.sh build`, so the built server does not need `frontend/dist` at runtime:
 
 ```bash
