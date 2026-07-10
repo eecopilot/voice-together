@@ -3,12 +3,12 @@ import { Headphones, Loader2, MoreVertical, Pause, Play, RefreshCw, Repeat, Sear
 import { Button } from './components/ui/button'
 import { Card, CardBody, CardHeader } from './components/ui/card'
 import { Select } from './components/ui/select'
-import { deleteClip, getClip, listClips, reprocessClip, uploadClip } from './lib/api'
+import { deleteClip, getClip, importDemo, listClips, reprocessClip, uploadClip } from './lib/api'
 import { cn, formatTime } from './lib/utils'
 import type { Clip, ClipDetail } from './types'
 
 const speeds = [0.75, 1, 1.25]
-const maxVisibleClips = 10
+const clipPageSize = 10
 
 type ClipFilter = 'all' | Clip['status']
 
@@ -27,6 +27,8 @@ const statusLabels: Record<Clip['status'], string> = {
 
 function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const openRequestIdRef = useRef(0)
   const [clips, setClips] = useState<Clip[]>([])
   const [detail, setDetail] = useState<ClipDetail | null>(null)
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
@@ -34,12 +36,15 @@ function App() {
   const [speed, setSpeed] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState('')
+  const [isImportingDemo, setIsImportingDemo] = useState(false)
+  const [openingId, setOpeningId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [isPlaying, setIsPlaying] = useState(false)
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
   const [clipQuery, setClipQuery] = useState('')
   const [clipFilter, setClipFilter] = useState<ClipFilter>('all')
+  const [visibleClipLimit, setVisibleClipLimit] = useState(clipPageSize)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
 
@@ -50,7 +55,7 @@ function App() {
   const progressPercent = effectiveDuration > 0 ? (seekValue / effectiveDuration) * 100 : 0
 
   useEffect(() => {
-    refreshClips()
+    void refreshClips(true)
   }, [])
 
   useEffect(() => {
@@ -90,14 +95,14 @@ function App() {
       return searchable.includes(query)
     })
   }, [clipFilter, clipQuery, clips])
-  const displayedClips = visibleClips.slice(0, maxVisibleClips)
+  const displayedClips = visibleClips.slice(0, visibleClipLimit)
   const hasMoreClips = visibleClips.length > displayedClips.length
 
-  async function refreshClips() {
+  async function refreshClips(openPreferredIfEmpty = false) {
     try {
       const next = await listClips()
       setClips(next)
-      if (!detail && next.length > 0) {
+      if (openPreferredIfEmpty && !detail && next.length > 0) {
         const preferredClip = next.find((clip) => clip.status === 'ready') ?? next[0]
         await openClip(preferredClip.id)
       }
@@ -107,14 +112,26 @@ function App() {
   }
 
   async function openClip(id: string) {
+    const requestId = ++openRequestIdRef.current
+    setOpeningId(id)
     setError('')
     setNotice('')
     setOpenMenuId(null)
-    setIsPlaying(false)
-    resetPlaybackState()
-    const next = normalizeDetail(await getClip(id))
-    setDetail(next)
-    setSelectedIndex(next.segments.length > 0 ? 0 : null)
+    try {
+      const next = normalizeDetail(await getClip(id))
+      if (requestId !== openRequestIdRef.current) {
+        return
+      }
+      applyDetail(next, false)
+    } catch (err) {
+      if (requestId === openRequestIdRef.current) {
+        setError(errorMessage(err))
+      }
+    } finally {
+      if (requestId === openRequestIdRef.current) {
+        setOpeningId(null)
+      }
+    }
   }
 
   async function handleUpload(event: FormEvent) {
@@ -130,17 +147,33 @@ function App() {
     try {
       const title = file.name.replace(/\.[^.]+$/, '')
       const next = normalizeDetail(await uploadClip(file, title))
-      setDetail(next)
-      setSelectedIndex(next.segments.length > 0 ? 0 : null)
-      setIsPlaying(false)
-      resetPlaybackState()
+      applyDetail(next)
       setFile(null)
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
       setNotice(next.reused ? '这个文件已经在片段库中，已打开已有片段。' : '')
       await refreshClips()
     } catch (err) {
       setError(errorMessage(err))
     } finally {
       setBusy('')
+    }
+  }
+
+  async function handleImportDemo() {
+    setIsImportingDemo(true)
+    setError('')
+    setNotice('')
+    try {
+      const next = normalizeDetail(await importDemo())
+      applyDetail(next)
+      setNotice(next.reused ? 'demo.mp4 已在片段库中，已打开已有片段。' : '已导入 demo.mp4。')
+      await refreshClips()
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setIsImportingDemo(false)
     }
   }
 
@@ -151,10 +184,7 @@ function App() {
     setOpenMenuId(null)
     try {
       const next = normalizeDetail(await reprocessClip(id))
-      setDetail(next)
-      setSelectedIndex(next.segments.length > 0 ? 0 : null)
-      setIsPlaying(false)
-      resetPlaybackState()
+      applyDetail(next)
       setNotice('已重新完成转写。')
       await refreshClips()
     } catch (err) {
@@ -164,20 +194,35 @@ function App() {
     }
   }
 
-  async function handleDelete(id: string) {
-    setBusy(`delete-${id}`)
+  async function handleDelete(clip: Clip) {
+    if (!window.confirm(`确定删除“${clip.title}”吗？此操作无法撤销。`)) {
+      return
+    }
+
+    const isDeletingCurrentClip = detail?.clip.id === clip.id
+    setBusy(`delete-${clip.id}`)
     setError('')
     setNotice('')
     setOpenMenuId(null)
     try {
-      await deleteClip(id)
-      if (detail?.clip.id === id) {
+      await deleteClip(clip.id)
+      if (isDeletingCurrentClip) {
+        openRequestIdRef.current += 1
+        setOpeningId(null)
+        audioRef.current?.pause()
         setDetail(null)
         setSelectedIndex(null)
         setIsPlaying(false)
         resetPlaybackState()
       }
-      await refreshClips()
+      const nextClips = await listClips()
+      setClips(nextClips)
+      if (isDeletingCurrentClip) {
+        const preferredClip = nextClips.find((item) => item.status === 'ready') ?? nextClips[0]
+        if (preferredClip) {
+          await openClip(preferredClip.id)
+        }
+      }
     } catch (err) {
       setError(errorMessage(err))
     } finally {
@@ -188,6 +233,18 @@ function App() {
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     setFile(event.target.files?.[0] ?? null)
     setNotice('')
+  }
+
+  function applyDetail(next: ClipDetail, invalidatePendingOpen = true) {
+    if (invalidatePendingOpen) {
+      openRequestIdRef.current += 1
+      setOpeningId(null)
+    }
+    audioRef.current?.pause()
+    setDetail(next)
+    setSelectedIndex(next.segments.length > 0 ? 0 : null)
+    setIsPlaying(false)
+    resetPlaybackState()
   }
 
   function playSegment(index: number) {
@@ -298,16 +355,28 @@ function App() {
                       选择文件
                     </span>
                     <span className="truncate text-sm font-medium text-muted">{file?.name ?? '未选择文件'}</span>
-                    <input className="sr-only" type="file" accept="video/*,audio/*" onChange={handleFileChange} />
+                    <input ref={fileInputRef} className="sr-only" type="file" accept="video/*,audio/*" onChange={handleFileChange} />
                   </span>
                 </label>
-                <Button variant="primary" type="submit" disabled={busy === 'upload'}>
+                <Button variant="primary" type="submit" disabled={busy === 'upload' || isImportingDemo}>
                   {busy === 'upload' ? <Loader2 className="animate-spin" size={16} /> : <Upload size={16} />}
                   上传并转写
                 </Button>
+                <Button type="button" onClick={() => void handleImportDemo()} disabled={isImportingDemo || busy === 'upload'}>
+                  {isImportingDemo ? <Loader2 className="animate-spin" size={16} /> : <Headphones size={16} />}
+                  导入 demo.mp4
+                </Button>
               </form>
-              {error ? <p className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p> : null}
-              {notice ? <p className="mt-3 rounded-md bg-teal-50 px-3 py-2 text-sm text-primary">{notice}</p> : null}
+              {error ? (
+                <p className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700" role="alert" aria-live="assertive">
+                  {error}
+                </p>
+              ) : null}
+              {notice ? (
+                <p className="mt-3 rounded-md bg-teal-50 px-3 py-2 text-sm text-primary" role="status" aria-live="polite">
+                  {notice}
+                </p>
+              ) : null}
             </CardBody>
           </Card>
 
@@ -326,9 +395,11 @@ function App() {
                   value={clipQuery}
                   onChange={(event) => {
                     setClipQuery(event.target.value)
+                    setVisibleClipLimit(clipPageSize)
                     setOpenMenuId(null)
                   }}
                   placeholder="搜索标题或语言"
+                  aria-label="搜索片段"
                 />
               </label>
               <div className="grid grid-cols-4 gap-1 rounded-md bg-slate-100 p-1">
@@ -342,8 +413,10 @@ function App() {
                     type="button"
                     onClick={() => {
                       setClipFilter(option.value)
+                      setVisibleClipLimit(clipPageSize)
                       setOpenMenuId(null)
                     }}
+                    aria-pressed={clipFilter === option.value}
                   >
                     {option.label} {clipStats[option.value]}
                   </button>
@@ -357,22 +430,26 @@ function App() {
                 <p className="px-2 py-6 text-sm text-muted">没有匹配的片段。</p>
               ) : (
                 <div className="grid gap-2">
-                {hasMoreClips ? (
-                  <p className="rounded-md bg-slate-50 px-3 py-2 text-xs font-medium text-muted">
-                    只显示前 {maxVisibleClips} 个，搜索可找到更多片段。
-                  </p>
-                ) : null}
-                {displayedClips.map((clip) => (
-                  <article
-                    key={clip.id}
-                    className={cn(
-                      'grid min-w-0 gap-2 rounded-md border p-3',
-                      detail?.clip.id === clip.id ? 'border-primary bg-teal-50/60' : 'border-border bg-white'
-                    )}
-                  >
+                  {displayedClips.map((clip) => (
+                    <article
+                      key={clip.id}
+                      className={cn(
+                        'grid min-w-0 gap-2 rounded-md border p-3',
+                        detail?.clip.id === clip.id ? 'border-primary bg-teal-50/60' : 'border-border bg-white'
+                      )}
+                    >
                     <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2">
-                      <button className="min-w-0 text-left" type="button" onClick={() => openClip(clip.id)}>
-                        <strong className="block truncate text-sm">{clip.title}</strong>
+                      <button
+                        className="min-w-0 text-left disabled:opacity-70"
+                        type="button"
+                        onClick={() => void openClip(clip.id)}
+                        disabled={openingId === clip.id}
+                        aria-busy={openingId === clip.id}
+                      >
+                        <strong className="flex min-w-0 items-center gap-2 text-sm">
+                          <span className="truncate">{clip.title}</span>
+                          {openingId === clip.id ? <Loader2 className="shrink-0 animate-spin" size={13} /> : null}
+                        </strong>
                         <span className="mt-1 flex min-w-0 items-center gap-2 text-xs text-muted">
                           <span className="shrink-0">{clip.status === 'ready' ? `${clip.duration.toFixed(1)}s` : statusLabels[clip.status]}</span>
                           <span className="truncate">{formatClipDate(clip.created_at)}</span>
@@ -385,6 +462,8 @@ function App() {
                           type="button"
                           onClick={() => setOpenMenuId(openMenuId === clip.id ? null : clip.id)}
                           aria-label="片段操作"
+                          aria-expanded={openMenuId === clip.id}
+                          aria-controls={`clip-menu-${clip.id}`}
                         >
                           <MoreVertical size={15} />
                         </Button>
@@ -397,7 +476,7 @@ function App() {
                       {detail?.clip.id === clip.id ? <span className="text-xs font-semibold text-primary">当前</span> : null}
                     </div>
                     {openMenuId === clip.id ? (
-                      <div className="grid grid-cols-2 gap-2 border-t border-border pt-2">
+                      <div id={`clip-menu-${clip.id}`} className="grid grid-cols-2 gap-2 border-t border-border pt-2">
                         <button
                           className="inline-flex h-8 items-center justify-center gap-2 rounded-md bg-slate-50 px-2 text-xs font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50"
                           type="button"
@@ -410,7 +489,7 @@ function App() {
                         <button
                           className="inline-flex h-8 items-center justify-center gap-2 rounded-md bg-red-50 px-2 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:opacity-50"
                           type="button"
-                          onClick={() => handleDelete(clip.id)}
+                          onClick={() => void handleDelete(clip)}
                           disabled={busy === `delete-${clip.id}`}
                         >
                           <Trash2 size={13} />
@@ -418,8 +497,17 @@ function App() {
                         </button>
                       </div>
                     ) : null}
-                  </article>
-                ))}
+                    </article>
+                  ))}
+                  {hasMoreClips ? (
+                    <Button
+                      className="w-full"
+                      type="button"
+                      onClick={() => setVisibleClipLimit((limit) => Math.min(limit + clipPageSize, visibleClips.length))}
+                    >
+                      显示更多（剩余 {visibleClips.length - displayedClips.length} 个）
+                    </Button>
+                  ) : null}
                 </div>
               )}
             </CardBody>
