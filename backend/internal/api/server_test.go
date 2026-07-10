@@ -424,26 +424,221 @@ func TestDeleteReturnsConflictWhenClipLocked(t *testing.T) {
 	}
 }
 
-func TestUploadReturnsConflictWhenProcessingBusy(t *testing.T) {
-	server, _, _ := newTestServer(t, fakeMediaProcessor{}, fakeTranscriber{})
-	finish, ok := server.tryStartProcessing()
+func TestUploadReturnsAcceptedBeforeBackgroundProcessingCompletes(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mediaProcessor := fakeMediaProcessor{extract: func(ctx context.Context, _ string, runDir string) (media.Result, error) {
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return media.Result{}, ctx.Err()
+		}
+		if err := os.MkdirAll(runDir, 0o755); err != nil {
+			return media.Result{}, err
+		}
+		audioPath := filepath.Join(runDir, "audio.mp3")
+		wavPath := filepath.Join(runDir, "transcribe.wav")
+		if err := os.WriteFile(audioPath, []byte("audio"), 0o600); err != nil {
+			return media.Result{}, err
+		}
+		if err := os.WriteFile(wavPath, []byte("wav"), 0o600); err != nil {
+			return media.Result{}, err
+		}
+		return media.Result{BrowserAudioPath: audioPath, TranscriptionWAVPath: wavPath}, nil
+	}}
+	transcriber := fakeTranscriber{transcribe: func(context.Context, string, string) (transcribe.Result, error) {
+		return transcribe.Result{
+			Language: "en",
+			Duration: 3,
+			Segments: []db.Segment{{Start: 0, End: 3, Text: "ready"}},
+		}, nil
+	}}
+	server, store, _ := newTestServer(t, mediaProcessor, transcriber)
+
+	finishBusy, ok := server.tryStartProcessing()
 	if !ok {
 		t.Fatal("failed to occupy processing slot")
 	}
-	defer finish()
 
 	body, contentType := multipartUpload(t, "sample.mp3", []byte("audio"))
-	request := httptest.NewRequest(http.MethodPost, "/api/clips", body)
+	requestContext, cancelRequest := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/api/clips", body).WithContext(requestContext)
 	request.Header.Set("Content-Type", contentType)
 	response := httptest.NewRecorder()
 	server.Routes().ServeHTTP(response, request)
+	cancelRequest()
 
-	if response.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusConflict, response.Body.String())
+	if response.Code != http.StatusAccepted {
+		finishBusy()
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusAccepted, response.Body.String())
+	}
+	var payload clipResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		finishBusy()
+		t.Fatal(err)
+	}
+	if payload.Clip.Status != "processing" || len(payload.Segments) != 0 {
+		finishBusy()
+		t.Fatalf("unexpected accepted response: %#v", payload)
+	}
+	stored, _, err := store.GetClip(context.Background(), payload.Clip.ID)
+	if err != nil {
+		finishBusy()
+		t.Fatal(err)
+	}
+	if stored.Status != "processing" {
+		finishBusy()
+		t.Fatalf("stored status = %q, want processing", stored.Status)
+	}
+
+	finishBusy()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background processing did not start")
+	}
+	close(release)
+	waitForClipStatus(t, store, payload.Clip.ID, "ready", 3*time.Second)
+	stored, segments, err := store.GetClip(context.Background(), payload.Clip.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != "ready" || len(segments) != 1 || segments[0].Text != "ready" {
+		t.Fatalf("background processing did not complete: clip=%#v segments=%#v", stored, segments)
+	}
+}
+
+func TestUploadQueueIsBoundedAndOnlyAcceptedWhenEnqueued(t *testing.T) {
+	mediaProcessor := fakeMediaProcessor{extract: func(context.Context, string, string) (media.Result, error) {
+		return media.Result{}, errors.New("stop test processing")
+	}}
+	server, _, _ := newTestServerWithQueueCapacity(t, mediaProcessor, fakeTranscriber{}, 1)
+	finishBusy, ok := server.tryStartProcessing()
+	if !ok {
+		t.Fatal("failed to occupy processing slot")
+	}
+	released := false
+	defer func() {
+		if !released {
+			finishBusy()
+		}
+	}()
+
+	first := requestUpload(t, server, "first.mp3", []byte("first audio"))
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d, want %d; body=%s", first.Code, http.StatusAccepted, first.Body.String())
+	}
+	waitForQueueLength(t, server, 0, 2*time.Second)
+
+	second := requestUpload(t, server, "second.mp3", []byte("second audio"))
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("second status = %d, want %d; body=%s", second.Code, http.StatusAccepted, second.Body.String())
+	}
+	third := requestUpload(t, server, "third.mp3", []byte("third audio"))
+	if third.Code != http.StatusServiceUnavailable {
+		t.Fatalf("third status = %d, want %d; body=%s", third.Code, http.StatusServiceUnavailable, third.Body.String())
+	}
+
+	finishBusy()
+	released = true
+}
+
+func TestShutdownCancelsBackgroundProcessingAndCleansRun(t *testing.T) {
+	started := make(chan struct{})
+	mediaProcessor := fakeMediaProcessor{extract: func(ctx context.Context, _ string, runDir string) (media.Result, error) {
+		if err := os.MkdirAll(runDir, 0o755); err != nil {
+			return media.Result{}, err
+		}
+		if err := os.WriteFile(filepath.Join(runDir, "partial"), []byte("partial"), 0o600); err != nil {
+			return media.Result{}, err
+		}
+		close(started)
+		<-ctx.Done()
+		return media.Result{}, ctx.Err()
+	}}
+	server, store, paths := newTestServer(t, mediaProcessor, fakeTranscriber{})
+	response := requestUpload(t, server, "cancel.mp3", []byte("cancel audio"))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusAccepted, response.Body.String())
+	}
+	var payload clipResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background processing did not start")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	clip, _, err := store.GetClip(context.Background(), payload.Clip.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clip.Status != "error" {
+		t.Fatalf("status = %q, want error", clip.Status)
+	}
+	runs, err := filepath.Glob(filepath.Join(paths.ClipsDir, payload.Clip.ID, "runs", "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("partial runs remain after shutdown: %v", runs)
+	}
+}
+
+func TestNewServerRecoversInterruptedProcessingClip(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	paths := storage.Paths{
+		ProjectRoot: root,
+		DataDir:     dataDir,
+		UploadsDir:  filepath.Join(dataDir, "uploads"),
+		ClipsDir:    filepath.Join(dataDir, "clips"),
+		DBPath:      filepath.Join(dataDir, "test.db"),
+	}
+	if err := paths.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := db.Open(context.Background(), paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateClip(context.Background(), db.Clip{
+		ID: "interrupted", Title: "Interrupted", SourcePath: filepath.Join(paths.UploadsDir, "interrupted.mp3"),
+		Status: "processing", CreatedAt: time.Now(),
+	}); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	server := New(store, paths, fakeMediaProcessor{}, fakeTranscriber{}, nil)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+		_ = store.Close()
+	})
+
+	clip, _, err := store.GetClip(context.Background(), "interrupted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clip.Status != "error" || clip.Error == "" {
+		t.Fatalf("interrupted clip was not recovered: %#v", clip)
 	}
 }
 
 func newTestServer(t *testing.T, mediaProcessor MediaProcessor, transcriber Transcriber) (*Server, *db.Store, storage.Paths) {
+	return newTestServerWithQueueCapacity(t, mediaProcessor, transcriber, defaultProcessingQueueCapacity)
+}
+
+func newTestServerWithQueueCapacity(t *testing.T, mediaProcessor MediaProcessor, transcriber Transcriber, queueCapacity int) (*Server, *db.Store, storage.Paths) {
 	t.Helper()
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
@@ -461,8 +656,16 @@ func newTestServer(t *testing.T, mediaProcessor MediaProcessor, transcriber Tran
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
-	return New(store, paths, mediaProcessor, transcriber, nil), store, paths
+	server := newServer(store, paths, mediaProcessor, transcriber, nil, queueCapacity)
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("server shutdown: %v", err)
+		}
+		_ = store.Close()
+	})
+	return server, store, paths
 }
 
 func seedClipList(t *testing.T, store *db.Store) {
@@ -507,6 +710,45 @@ func requestClipList(t *testing.T, server *Server, target string) clipListPayloa
 		t.Fatal(err)
 	}
 	return payload
+}
+
+func requestUpload(t *testing.T, server *Server, filename string, data []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	body, contentType := multipartUpload(t, filename, data)
+	request := httptest.NewRequest(http.MethodPost, "/api/clips", body)
+	request.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	server.Routes().ServeHTTP(response, request)
+	return response
+}
+
+func waitForQueueLength(t *testing.T, server *Server, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(server.jobQueue) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("queue length = %d, want %d", len(server.jobQueue), want)
+}
+
+func waitForClipStatus(t *testing.T, store *db.Store, clipID string, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		clip, _, err := store.GetClip(context.Background(), clipID)
+		if err == nil && clip.Status == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	clip, _, err := store.GetClip(context.Background(), clipID)
+	if err != nil {
+		t.Fatalf("get clip %s: %v", clipID, err)
+	}
+	t.Fatalf("clip status = %q, want %q", clip.Status, want)
 }
 
 func multipartUpload(t *testing.T, filename string, data []byte) (*bytes.Buffer, string) {

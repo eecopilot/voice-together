@@ -1,12 +1,28 @@
 import type { ClipDetail, ClipListParams, ClipListResponse } from '../types'
 
-async function readJSON<T>(response: Response): Promise<T> {
-  const text = await response.text()
-  const data = text ? JSON.parse(text) : null
-  if (!response.ok) {
-    throw new Error(data?.error || `HTTP ${response.status}`)
+export type UploadProgress =
+  | { phase: 'uploading'; percent: number | null }
+  | { phase: 'confirming' }
+
+function parseJSON<T>(text: string, status: number, ok: boolean): T {
+  let data: any = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      if (ok) {
+        throw new Error('Server returned invalid JSON')
+      }
+    }
+  }
+  if (!ok) {
+    throw new Error(data?.error || `HTTP ${status}`)
   }
   return data as T
+}
+
+async function readJSON<T>(response: Response): Promise<T> {
+  return parseJSON<T>(await response.text(), response.status, response.ok)
 }
 
 export async function listClips(params: ClipListParams = {}): Promise<ClipListResponse> {
@@ -33,15 +49,36 @@ export async function getClip(id: string): Promise<ClipDetail> {
   return readJSON<ClipDetail>(response)
 }
 
-export async function uploadClip(file: File, title: string): Promise<ClipDetail> {
+export async function uploadClip(
+  file: File,
+  title: string,
+  onProgress?: (progress: UploadProgress) => void
+): Promise<ClipDetail> {
   const body = new FormData()
   body.append('file', file)
   body.append('title', title)
-  const response = await fetch('/api/clips', {
-    method: 'POST',
-    body
+
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open('POST', '/api/clips')
+    request.upload.onprogress = (event) => {
+      onProgress?.({
+        phase: 'uploading',
+        percent: event.lengthComputable ? Math.min(99, Math.round((event.loaded / event.total) * 100)) : null
+      })
+    }
+    request.upload.onload = () => onProgress?.({ phase: 'confirming' })
+    request.onload = () => {
+      try {
+        resolve(parseJSON<ClipDetail>(request.responseText, request.status, request.status >= 200 && request.status < 300))
+      } catch (error) {
+        reject(error)
+      }
+    }
+    request.onerror = () => reject(new Error('Upload connection failed'))
+    request.onabort = () => reject(new Error('Upload was cancelled'))
+    request.send(body)
   })
-  return readJSON<ClipDetail>(response)
 }
 
 export async function reprocessClip(id: string): Promise<ClipDetail> {

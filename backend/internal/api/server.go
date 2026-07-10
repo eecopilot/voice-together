@@ -28,9 +28,19 @@ import (
 	"voice-together/backend/internal/transcribe"
 )
 
-const maxUploadBytes int64 = 500 << 20
+const (
+	maxUploadBytes                 int64 = 500 << 20
+	defaultProcessingQueueCapacity       = 8
+	processingTimeout                    = 25 * time.Minute
+	cleanupTimeout                       = 5 * time.Second
+)
 
-var errUnsupportedMedia = errors.New("unsupported media type")
+var (
+	errUnsupportedMedia   = errors.New("unsupported media type")
+	errProcessingQueue    = errors.New("processing queue is full")
+	errServerShuttingDown = errors.New("server is shutting down")
+	errClipAlreadyQueued  = errors.New("clip is already queued")
+)
 
 type MediaProcessor interface {
 	Extract(context.Context, string, string) (media.Result, error)
@@ -63,6 +73,12 @@ func (l *keyedLocks) tryLock(key string) (func(), bool) {
 	}, true
 }
 
+type clipProcessingJob struct {
+	clip             db.Clip
+	unlock           func()
+	releaseAdmission func()
+}
+
 type Server struct {
 	store      *db.Store
 	paths      storage.Paths
@@ -71,6 +87,14 @@ type Server struct {
 	staticFS   fs.FS
 	processing chan struct{}
 	clipLocks  *keyedLocks
+
+	queueMu      sync.Mutex
+	accepting    bool
+	jobQueue     chan clipProcessingJob
+	admissions   chan struct{}
+	workerCtx    context.Context
+	cancelWorker context.CancelFunc
+	workerDone   chan struct{}
 }
 
 type clipResponse struct {
@@ -80,15 +104,32 @@ type clipResponse struct {
 }
 
 func New(store *db.Store, paths storage.Paths, mediaProcessor MediaProcessor, transcriber Transcriber, staticFS fs.FS) *Server {
-	return &Server{
-		store:      store,
-		paths:      paths,
-		media:      mediaProcessor,
-		transcribe: transcriber,
-		staticFS:   staticFS,
-		processing: make(chan struct{}, 1),
-		clipLocks:  newKeyedLocks(),
+	return newServer(store, paths, mediaProcessor, transcriber, staticFS, defaultProcessingQueueCapacity)
+}
+
+func newServer(store *db.Store, paths storage.Paths, mediaProcessor MediaProcessor, transcriber Transcriber, staticFS fs.FS, queueCapacity int) *Server {
+	if queueCapacity < 1 {
+		queueCapacity = 1
 	}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	server := &Server{
+		store:        store,
+		paths:        paths,
+		media:        mediaProcessor,
+		transcribe:   transcriber,
+		staticFS:     staticFS,
+		processing:   make(chan struct{}, 1),
+		clipLocks:    newKeyedLocks(),
+		accepting:    true,
+		jobQueue:     make(chan clipProcessingJob, queueCapacity),
+		admissions:   make(chan struct{}, queueCapacity+1),
+		workerCtx:    workerCtx,
+		cancelWorker: cancelWorker,
+		workerDone:   make(chan struct{}),
+	}
+	server.recoverInterruptedClips()
+	go server.runProcessingWorker()
+	return server
 }
 
 func (s *Server) tryStartProcessing() (func(), bool) {
@@ -97,6 +138,149 @@ func (s *Server) tryStartProcessing() (func(), bool) {
 		return func() { <-s.processing }, true
 	default:
 		return nil, false
+	}
+}
+
+func (s *Server) startProcessing(ctx context.Context) (func(), error) {
+	select {
+	case s.processing <- struct{}{}:
+		return func() { <-s.processing }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Server) reserveUpload() (func(), error) {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if !s.accepting {
+		return nil, errServerShuttingDown
+	}
+	select {
+	case s.admissions <- struct{}{}:
+		return func() { <-s.admissions }, nil
+	default:
+		return nil, errProcessingQueue
+	}
+}
+
+func (s *Server) queueClipProcessing(clip db.Clip, releaseAdmission func()) error {
+	unlock, ok := s.clipLocks.tryLock(clip.ID)
+	if !ok {
+		return errClipAlreadyQueued
+	}
+
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if !s.accepting {
+		unlock()
+		return errServerShuttingDown
+	}
+	select {
+	case s.jobQueue <- clipProcessingJob{clip: clip, unlock: unlock, releaseAdmission: releaseAdmission}:
+		return nil
+	default:
+		unlock()
+		return errProcessingQueue
+	}
+}
+
+func (s *Server) runProcessingWorker() {
+	defer close(s.workerDone)
+	for {
+		if err := s.workerCtx.Err(); err != nil {
+			s.failQueuedJobs(err)
+			return
+		}
+		select {
+		case <-s.workerCtx.Done():
+			s.failQueuedJobs(s.workerCtx.Err())
+			return
+		case job := <-s.jobQueue:
+			if err := s.workerCtx.Err(); err != nil {
+				s.failJob(job, err)
+				s.failQueuedJobs(err)
+				return
+			}
+			s.runProcessingJob(job)
+		}
+	}
+}
+
+func (s *Server) runProcessingJob(job clipProcessingJob) {
+	defer job.unlock()
+	defer job.releaseAdmission()
+
+	finishProcessing, err := s.startProcessing(s.workerCtx)
+	if err != nil {
+		s.markClipError(job.clip, err)
+		return
+	}
+	defer finishProcessing()
+
+	ctx, cancel := context.WithTimeout(s.workerCtx, processingTimeout)
+	defer cancel()
+	if _, err := s.processExistingSource(ctx, job.clip, false); err != nil {
+		log.Printf("process uploaded clip %s: %v", job.clip.ID, err)
+	}
+}
+
+func (s *Server) failQueuedJobs(reason error) {
+	for {
+		select {
+		case job := <-s.jobQueue:
+			s.failJob(job, reason)
+		default:
+			return
+		}
+	}
+}
+
+func (s *Server) failJob(job clipProcessingJob, reason error) {
+	s.markClipError(job.clip, reason)
+	job.unlock()
+	job.releaseAdmission()
+}
+
+func (s *Server) markClipError(clip db.Clip, reason error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	if err := s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", reason.Error()); err != nil {
+		log.Printf("mark clip %s failed: %v", clip.ID, err)
+	}
+}
+
+func (s *Server) recoverInterruptedClips() {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	clips, err := s.store.ListClips(ctx)
+	if err != nil {
+		log.Printf("recover interrupted clips: %v", err)
+		return
+	}
+	for _, clip := range clips {
+		if clip.Status != "processing" {
+			continue
+		}
+		if err := s.store.UpdateClipProcessed(ctx, clip.ID, clip.AudioPath, clip.Duration, clip.Language, "error", "processing interrupted by server restart"); err != nil {
+			log.Printf("recover interrupted clip %s: %v", clip.ID, err)
+		}
+	}
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.queueMu.Lock()
+	if s.accepting {
+		s.accepting = false
+		s.cancelWorker()
+	}
+	s.queueMu.Unlock()
+
+	select {
+	case <-s.workerDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -184,12 +368,16 @@ func parseQueryInteger(raw string, defaultValue int, minimum int, maximum int, n
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	finishProcessing, ok := s.tryStartProcessing()
-	if !ok {
-		writeError(w, http.StatusConflict, errors.New("media processing is busy"))
+	releaseAdmission, err := s.reserveUpload()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	defer finishProcessing()
+	defer func() {
+		if releaseAdmission != nil {
+			releaseAdmission()
+		}
+	}()
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
@@ -229,11 +417,21 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	status := http.StatusCreated
 	if response.Reused {
-		status = http.StatusOK
+		writeJSON(w, http.StatusOK, response)
+		return
 	}
-	writeJSON(w, status, response)
+	if err := s.queueClipProcessing(response.Clip, releaseAdmission); err != nil {
+		s.markClipError(response.Clip, err)
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errClipAlreadyQueued) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err)
+		return
+	}
+	releaseAdmission = nil
+	writeJSON(w, http.StatusAccepted, response)
 }
 
 func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
@@ -512,16 +710,10 @@ func (s *Server) importMultipart(ctx context.Context, file multipart.File, heade
 		existing.Reused = true
 		return existing, nil
 	}
-	return s.processSource(ctx, id, title, sourcePath, sourceHash, language)
+	return s.createClip(ctx, id, title, sourcePath, sourceHash, language)
 }
 
-func (s *Server) processSource(ctx context.Context, id string, title string, sourcePath string, sourceHash string, language string) (clipResponse, error) {
-	unlock, ok := s.clipLocks.tryLock(id)
-	if !ok {
-		return clipResponse{}, errors.New("clip is busy")
-	}
-	defer unlock()
-
+func (s *Server) createClip(ctx context.Context, id string, title string, sourcePath string, sourceHash string, language string) (clipResponse, error) {
 	now := time.Now()
 	clip := db.Clip{
 		ID:         id,
@@ -536,7 +728,7 @@ func (s *Server) processSource(ctx context.Context, id string, title string, sou
 		_ = os.Remove(sourcePath)
 		return clipResponse{}, err
 	}
-	return s.processExistingSource(ctx, clip, false)
+	return clipResponse{Clip: clip, Segments: []db.Segment{}}, nil
 }
 
 func (s *Server) processExistingSource(ctx context.Context, clip db.Clip, preserveExisting bool) (clipResponse, error) {
@@ -551,7 +743,7 @@ func (s *Server) processExistingSource(ctx context.Context, clip db.Clip, preser
 	mediaResult, err := s.media.Extract(ctx, clip.SourcePath, runDir)
 	if err != nil {
 		if !preserveExisting {
-			_ = s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", err.Error())
+			s.markClipError(clip, err)
 		}
 		return clipResponse{}, err
 	}
@@ -560,7 +752,7 @@ func (s *Server) processExistingSource(ctx context.Context, clip db.Clip, preser
 	transcribeResult, err := s.transcribe.Transcribe(ctx, mediaResult.TranscriptionWAVPath, clip.Language)
 	if err != nil {
 		if !preserveExisting {
-			_ = s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", err.Error())
+			s.markClipError(clip, err)
 		}
 		return clipResponse{}, err
 	}
@@ -584,7 +776,7 @@ func (s *Server) processExistingSource(ctx context.Context, clip db.Clip, preser
 		transcribeResult.Segments,
 	); err != nil {
 		if !preserveExisting {
-			_ = s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", err.Error())
+			s.markClipError(clip, err)
 		}
 		return clipResponse{}, err
 	}

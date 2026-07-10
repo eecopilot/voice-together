@@ -4,11 +4,13 @@ import { Button } from './components/ui/button'
 import { Card, CardBody, CardHeader } from './components/ui/card'
 import { Select } from './components/ui/select'
 import { deleteClip, getClip, listClips, reprocessClip, uploadClip } from './lib/api'
+import type { UploadProgress } from './lib/api'
 import { cn, formatTime } from './lib/utils'
 import type { Clip, ClipCounts, ClipDetail, ClipFilter, ClipListResponse } from './types'
 
 const speeds = [0.75, 1, 1.25]
 const clipPageSize = 10
+const maxClipPageSize = 100
 const clipSearchDebounceMs = 250
 const emptyClipCounts: ClipCounts = { all: 0, ready: 0, processing: 0, error: 0 }
 
@@ -28,8 +30,12 @@ const statusLabels: Record<Clip['status'], string> = {
 function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const detailRef = useRef<ClipDetail | null>(null)
+  const selectedClipIntentIdRef = useRef<string | null>(null)
   const openRequestIdRef = useRef(0)
   const listRequestIdRef = useRef(0)
+  const foregroundListInFlightRef = useRef(0)
+  const pollInFlightRef = useRef(false)
   const activeClipQueryRef = useRef<{ query: string; filter: ClipFilter }>({ query: '', filter: 'all' })
   const [clips, setClips] = useState<Clip[]>([])
   const [clipTotal, setClipTotal] = useState(0)
@@ -39,7 +45,9 @@ function App() {
   const [loop, setLoop] = useState(true)
   const [speed, setSpeed] = useState(1)
   const [file, setFile] = useState<File | null>(null)
+  const [isUploading, setIsUploading] = useState(false)
   const [busy, setBusy] = useState('')
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null)
   const [openingId, setOpeningId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -92,6 +100,20 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [videoClip])
 
+  useEffect(() => {
+    if (
+      isClipSearchLoading ||
+      isLoadingMoreClips ||
+      (clipCounts.processing === 0 && detail?.clip.status !== 'processing')
+    ) {
+      return
+    }
+    const timer = window.setInterval(() => {
+      void pollProcessingClips()
+    }, 2000)
+    return () => window.clearInterval(timer)
+  }, [clipCounts.processing, detail?.clip.id, detail?.clip.status, isClipSearchLoading, isLoadingMoreClips])
+
   const playbackIndex = findSegmentIndex(segments, currentTime)
   const currentIndex = playbackIndex ?? selectedIndex
   const currentSegment = currentIndex === null ? null : segments[currentIndex] ?? null
@@ -104,15 +126,21 @@ function App() {
     query = activeClipQueryRef.current.query,
     filter = activeClipQueryRef.current.filter,
     append = false,
-    openPreferredIfEmpty = false
+    openPreferredIfEmpty = false,
+    preserveLoaded = false
   }: {
     query?: string
     filter?: ClipFilter
     append?: boolean
     openPreferredIfEmpty?: boolean
+    preserveLoaded?: boolean
   } = {}): Promise<ClipListResponse | null> {
     const requestId = ++listRequestIdRef.current
+    foregroundListInFlightRef.current += 1
     const offset = append ? clips.length : 0
+    const requestedLimit = preserveLoaded
+      ? Math.min(maxClipPageSize, Math.max(clipPageSize, clips.length))
+      : clipPageSize
     if (append) {
       setIsLoadingMoreClips(true)
     } else {
@@ -123,13 +151,19 @@ function App() {
       const response = await listClips({
         q: query || undefined,
         status: filter === 'all' ? undefined : filter,
-        limit: clipPageSize,
+        limit: requestedLimit,
         offset
       })
       if (requestId !== listRequestIdRef.current) {
         return null
       }
-      setClips((current) => (append ? appendUniqueClips(current, response.clips) : response.clips))
+      setClips((current) =>
+        append
+          ? appendUniqueClips(current, response.clips)
+          : preserveLoaded
+            ? reconcilePolledClips(current, response.clips, requestedLimit, response.total)
+            : response.clips
+      )
       setClipTotal(response.total)
       setClipCounts(response.counts)
       if (openPreferredIfEmpty && !detail && response.clips.length > 0) {
@@ -143,6 +177,7 @@ function App() {
       }
       return null
     } finally {
+      foregroundListInFlightRef.current = Math.max(0, foregroundListInFlightRef.current - 1)
       if (requestId === listRequestIdRef.current) {
         if (append) {
           setIsLoadingMoreClips(false)
@@ -153,8 +188,73 @@ function App() {
     }
   }
 
+  async function pollProcessingClips() {
+    if (pollInFlightRef.current || foregroundListInFlightRef.current > 0) {
+      return
+    }
+    pollInFlightRef.current = true
+    const currentDetail = detailRef.current
+    const processingClipId = currentDetail?.clip.status === 'processing' ? currentDetail.clip.id : ''
+    const selectionRequestId = openRequestIdRef.current
+    const foregroundListRequestId = listRequestIdRef.current
+    const activeQuery = activeClipQueryRef.current
+    const pollLimit = Math.min(maxClipPageSize, Math.max(clipPageSize, clips.length))
+    try {
+      try {
+        const response = await listClips({
+          q: activeQuery.query || undefined,
+          status: activeQuery.filter === 'all' ? undefined : activeQuery.filter,
+          limit: pollLimit,
+          offset: 0
+        })
+        if (foregroundListRequestId === listRequestIdRef.current && foregroundListInFlightRef.current === 0) {
+          setClips((current) => reconcilePolledClips(current, response.clips, pollLimit, response.total))
+          setClipTotal(response.total)
+          setClipCounts(response.counts)
+        }
+      } catch (err) {
+        if (foregroundListRequestId === listRequestIdRef.current && foregroundListInFlightRef.current === 0) {
+          setError(errorMessage(err))
+        }
+      }
+
+      if (
+        !processingClipId ||
+        selectionRequestId !== openRequestIdRef.current ||
+        detailRef.current?.clip.id !== processingClipId ||
+        selectedClipIntentIdRef.current !== processingClipId
+      ) {
+        return
+      }
+
+      try {
+        const next = normalizeDetail(await getClip(processingClipId))
+        if (
+          next.clip.status !== 'processing' &&
+          selectionRequestId === openRequestIdRef.current &&
+          detailRef.current?.clip.id === processingClipId &&
+          detailRef.current.clip.status === 'processing' &&
+          selectedClipIntentIdRef.current === processingClipId
+        ) {
+          applyDetail(next)
+        }
+      } catch (err) {
+        if (
+          selectionRequestId === openRequestIdRef.current &&
+          detailRef.current?.clip.id === processingClipId &&
+          selectedClipIntentIdRef.current === processingClipId
+        ) {
+          setError(errorMessage(err))
+        }
+      }
+    } finally {
+      pollInFlightRef.current = false
+    }
+  }
+
   async function openClip(id: string) {
     const requestId = ++openRequestIdRef.current
+    selectedClipIntentIdRef.current = id
     setVideoClip(null)
     setOpeningId(id)
     setError('')
@@ -168,6 +268,7 @@ function App() {
       applyDetail(next, false)
     } catch (err) {
       if (requestId === openRequestIdRef.current) {
+        selectedClipIntentIdRef.current = detailRef.current?.clip.id ?? null
         setError(errorMessage(err))
       }
     } finally {
@@ -184,23 +285,40 @@ function App() {
       return
     }
 
-    setBusy('upload')
+    const selectionRequestId = openRequestIdRef.current
+    setIsUploading(true)
+    setUploadProgress({ phase: 'uploading', percent: 0 })
     setError('')
     setNotice('')
     try {
       const title = file.name.replace(/\.[^.]+$/, '')
-      const next = normalizeDetail(await uploadClip(file, title))
-      applyDetail(next)
+      const next = normalizeDetail(await uploadClip(file, title, setUploadProgress))
+      setIsUploading(false)
+      setUploadProgress(null)
+      const shouldOpenUploadedClip = selectionRequestId === openRequestIdRef.current
+      if (shouldOpenUploadedClip) {
+        applyDetail(next)
+      }
+      if (!next.reused) {
+        upsertUploadedClip(next.clip)
+      }
       setFile(null)
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
       }
-      setNotice(next.reused ? '这个文件已经在片段库中，已打开已有片段。' : '')
-      await refreshClips()
+      setNotice(
+        next.reused
+          ? shouldOpenUploadedClip
+            ? '这个文件已经在片段库中，已打开已有片段。'
+            : '这个文件已经在片段库中。'
+          : '上传完成，正在后台提取音频并转写。'
+      )
+      void refreshClips({ preserveLoaded: true })
     } catch (err) {
       setError(errorMessage(err))
     } finally {
-      setBusy('')
+      setIsUploading(false)
+      setUploadProgress(null)
     }
   }
 
@@ -238,6 +356,8 @@ function App() {
         openRequestIdRef.current += 1
         setOpeningId(null)
         audioRef.current?.pause()
+        detailRef.current = null
+        selectedClipIntentIdRef.current = null
         setDetail(null)
         setSelectedIndex(null)
         setIsPlaying(false)
@@ -267,6 +387,19 @@ function App() {
     setNotice('')
   }
 
+  function upsertUploadedClip(clip: Clip) {
+    const activeQuery = activeClipQueryRef.current
+    if (!clipMatchesQuery(clip, activeQuery.query)) {
+      return
+    }
+    setClipCounts((current) => incrementClipCounts(current, clip.status))
+    if (activeQuery.filter !== 'all' && activeQuery.filter !== clip.status) {
+      return
+    }
+    setClipTotal((current) => current + 1)
+    setClips((current) => upsertClipFirst(current, clip))
+  }
+
   function invalidateClipListForSearch() {
     listRequestIdRef.current += 1
     setIsClipSearchLoading(true)
@@ -280,6 +413,8 @@ function App() {
     }
     setVideoClip(null)
     audioRef.current?.pause()
+    detailRef.current = next
+    selectedClipIntentIdRef.current = next.clip.id
     setDetail(next)
     setSelectedIndex(next.segments.length > 0 ? 0 : null)
     setIsPlaying(false)
@@ -387,19 +522,32 @@ function App() {
             </CardHeader>
             <CardBody>
               <form className="grid gap-3" onSubmit={handleUpload}>
-                <label className="grid gap-2 text-sm font-semibold">
+                <label className={cn('grid gap-2 text-sm font-semibold', isUploading && 'pointer-events-none opacity-60')}>
                   上传视频或音频
                   <span className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-2 rounded-md border border-border bg-white p-2">
                     <span className="inline-flex h-9 cursor-pointer items-center justify-center rounded border border-border bg-slate-50 px-3 text-sm font-semibold text-slate-900">
                       选择文件
                     </span>
                     <span className="truncate text-sm font-medium text-muted">{file?.name ?? '未选择文件'}</span>
-                    <input ref={fileInputRef} className="sr-only" type="file" accept="video/*,audio/*" onChange={handleFileChange} />
+                    <input
+                      ref={fileInputRef}
+                      className="sr-only"
+                      type="file"
+                      accept="video/*,audio/*"
+                      onChange={handleFileChange}
+                      disabled={isUploading}
+                    />
                   </span>
                 </label>
-                <Button variant="primary" type="submit" disabled={busy === 'upload'}>
-                  {busy === 'upload' ? <Loader2 className="animate-spin" size={16} /> : <Upload size={16} />}
-                  上传并转写
+                <Button variant="primary" type="submit" disabled={isUploading}>
+                  {isUploading ? <Loader2 className="animate-spin" size={16} /> : <Upload size={16} />}
+                  {isUploading
+                    ? uploadProgress?.phase === 'confirming'
+                      ? '服务器确认中…'
+                      : uploadProgress?.percent == null
+                        ? '正在上传…'
+                        : `上传中 ${uploadProgress.percent}%`
+                    : '上传并转写'}
                 </Button>
               </form>
               {error ? (
@@ -785,6 +933,36 @@ function normalizeDetail(detail: ClipDetail): ClipDetail {
 function appendUniqueClips(current: Clip[], next: Clip[]) {
   const existingIds = new Set(current.map((clip) => clip.id))
   return [...current, ...next.filter((clip) => !existingIds.has(clip.id))]
+}
+
+function upsertClipFirst(current: Clip[], clip: Clip) {
+  return [clip, ...current.filter((item) => item.id !== clip.id)]
+}
+
+function incrementClipCounts(current: ClipCounts, status: Clip['status']): ClipCounts {
+  return {
+    ...current,
+    all: current.all + 1,
+    [status]: current[status] + 1
+  }
+}
+
+function clipMatchesQuery(clip: Clip, query: string) {
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) {
+    return true
+  }
+  return clip.title.toLowerCase().includes(normalizedQuery) || clip.language.toLowerCase().includes(normalizedQuery)
+}
+
+function reconcilePolledClips(current: Clip[], next: Clip[], requestedLimit: number, total: number) {
+  if (current.length <= requestedLimit || total <= requestedLimit) {
+    return next
+  }
+  const incomingIds = new Set(next.map((clip) => clip.id))
+  const merged = [...next, ...current.filter((clip) => !incomingIds.has(clip.id))]
+  const targetLength = Math.min(total, Math.max(current.length, next.length))
+  return merged.slice(0, targetLength)
 }
 
 function isVideoSource(sourcePath: string) {

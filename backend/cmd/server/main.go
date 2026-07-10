@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"voice-together/backend/internal/api"
@@ -28,7 +29,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	store, err := db.Open(ctx, paths.DBPath)
@@ -37,9 +38,10 @@ func main() {
 	}
 	defer store.Close()
 
+	apiServer := api.New(store, paths, media.New(paths.ProjectRoot), transcribe.New(paths.ProjectRoot), web.Dist())
 	server := &http.Server{
 		Addr:              *addr,
-		Handler:           api.New(store, paths, media.New(paths.ProjectRoot), transcribe.New(paths.ProjectRoot), web.Dist()).Routes(),
+		Handler:           apiServer.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -55,12 +57,19 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Fatal(err)
+			log.Printf("HTTP shutdown: %v", err)
+			_ = server.Close()
 		}
 	case err := <-errCh:
 		if err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+			log.Printf("HTTP server stopped: %v", err)
 		}
+	}
+
+	jobShutdownCtx, cancelJobs := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelJobs()
+	if err := apiServer.Shutdown(jobShutdownCtx); err != nil {
+		log.Printf("background processing shutdown: %v", err)
 	}
 }
 
