@@ -3,7 +3,7 @@ import { Headphones, Loader2, MoreVertical, Pause, Play, RefreshCw, Repeat, Sear
 import { Button } from './components/ui/button'
 import { Card, CardBody, CardHeader } from './components/ui/card'
 import { Select } from './components/ui/select'
-import { deleteClip, getClip, importDemo, listClips, reprocessClip, uploadClip } from './lib/api'
+import { deleteClip, getClip, listClips, reprocessClip, uploadClip } from './lib/api'
 import { cn, formatTime } from './lib/utils'
 import type { Clip, ClipCounts, ClipDetail, ClipFilter, ClipListResponse } from './types'
 
@@ -40,7 +40,6 @@ function App() {
   const [speed, setSpeed] = useState(1)
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState('')
-  const [isImportingDemo, setIsImportingDemo] = useState(false)
   const [openingId, setOpeningId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -186,22 +185,6 @@ function App() {
       setError(errorMessage(err))
     } finally {
       setBusy('')
-    }
-  }
-
-  async function handleImportDemo() {
-    setIsImportingDemo(true)
-    setError('')
-    setNotice('')
-    try {
-      const next = normalizeDetail(await importDemo())
-      applyDetail(next)
-      setNotice(next.reused ? 'demo.mp4 已在片段库中，已打开已有片段。' : '已导入 demo.mp4。')
-      await refreshClips()
-    } catch (err) {
-      setError(errorMessage(err))
-    } finally {
-      setIsImportingDemo(false)
     }
   }
 
@@ -396,13 +379,9 @@ function App() {
                     <input ref={fileInputRef} className="sr-only" type="file" accept="video/*,audio/*" onChange={handleFileChange} />
                   </span>
                 </label>
-                <Button variant="primary" type="submit" disabled={busy === 'upload' || isImportingDemo}>
+                <Button variant="primary" type="submit" disabled={busy === 'upload'}>
                   {busy === 'upload' ? <Loader2 className="animate-spin" size={16} /> : <Upload size={16} />}
                   上传并转写
-                </Button>
-                <Button type="button" onClick={() => void handleImportDemo()} disabled={isImportingDemo || busy === 'upload'}>
-                  {isImportingDemo ? <Loader2 className="animate-spin" size={16} /> : <Headphones size={16} />}
-                  导入 demo.mp4
                 </Button>
               </form>
               {error ? (

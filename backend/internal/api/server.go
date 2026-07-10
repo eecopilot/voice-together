@@ -105,7 +105,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/clips", s.handleClips)
 	mux.HandleFunc("/api/clips/", s.handleClip)
-	mux.HandleFunc("/api/demo/import", s.handleDemoImport)
+	mux.HandleFunc("/api/", http.NotFound)
 	mux.HandleFunc("/", s.handleStatic)
 	return withCORS(mux)
 }
@@ -226,36 +226,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnsupportedMediaType, err)
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	status := http.StatusCreated
-	if response.Reused {
-		status = http.StatusOK
-	}
-	writeJSON(w, status, response)
-}
-
-func (s *Server) handleDemoImport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
-		return
-	}
-	finishProcessing, ok := s.tryStartProcessing()
-	if !ok {
-		writeError(w, http.StatusConflict, errors.New("media processing is busy"))
-		return
-	}
-	defer finishProcessing()
-
-	demoPath := filepath.Join(s.paths.ProjectRoot, "demo.mp4")
-	if _, err := os.Stat(demoPath); err != nil {
-		writeError(w, http.StatusNotFound, fmt.Errorf("demo.mp4 not found: %w", err))
-		return
-	}
-
-	response, err := s.importLocalFile(r.Context(), demoPath, "demo", "")
-	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -500,33 +470,6 @@ func (s *Server) importMultipart(ctx context.Context, file multipart.File, heade
 		return existing, nil
 	}
 	return s.processSource(ctx, id, title, sourcePath, sourceHash, language)
-}
-
-func (s *Server) importLocalFile(ctx context.Context, sourcePath string, title string, language string) (clipResponse, error) {
-	id := newID()
-	ext, err := safeExt(sourcePath)
-	if err != nil {
-		return clipResponse{}, err
-	}
-	savedPath := filepath.Join(s.paths.UploadsDir, id+ext)
-	source, err := os.Open(sourcePath)
-	if err != nil {
-		return clipResponse{}, err
-	}
-	defer source.Close()
-	sourceHash, err := writeFileAndHash(savedPath, source)
-	if err != nil {
-		return clipResponse{}, err
-	}
-	if existing, ok, err := s.findExistingByHash(ctx, sourceHash); err != nil {
-		_ = os.Remove(savedPath)
-		return clipResponse{}, err
-	} else if ok {
-		_ = os.Remove(savedPath)
-		existing.Reused = true
-		return existing, nil
-	}
-	return s.processSource(ctx, id, title, savedPath, sourceHash, language)
 }
 
 func (s *Server) processSource(ctx context.Context, id string, title string, sourcePath string, sourceHash string, language string) (clipResponse, error) {

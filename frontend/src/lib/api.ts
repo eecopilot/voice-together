@@ -44,11 +44,6 @@ export async function uploadClip(file: File, title: string): Promise<ClipDetail>
   return readJSON<ClipDetail>(response)
 }
 
-export async function importDemo(): Promise<ClipDetail> {
-  const response = await fetch('/api/demo/import', { method: 'POST' })
-  return readJSON<ClipDetail>(response)
-}
-
 export async function reprocessClip(id: string): Promise<ClipDetail> {
   const response = await fetch(`/api/clips/${id}/reprocess`, { method: 'POST' })
   return readJSON<ClipDetail>(response)

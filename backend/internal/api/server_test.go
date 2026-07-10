@@ -141,6 +141,18 @@ func TestDeleteMissingClipReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestDemoImportEndpointIsNotExposed(t *testing.T) {
+	server, _, _ := newTestServer(t, fakeMediaProcessor{}, fakeTranscriber{})
+	request := httptest.NewRequest(http.MethodPost, "/api/demo/import", nil)
+	response := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(response, request)
+
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusNotFound, response.Body.String())
+	}
+}
+
 func TestFailedReprocessPreservesExistingClip(t *testing.T) {
 	mediaProcessor := fakeMediaProcessor{extract: func(_ context.Context, _ string, runDir string) (media.Result, error) {
 		if err := os.MkdirAll(runDir, 0o755); err != nil {

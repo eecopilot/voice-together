@@ -37,8 +37,6 @@ Then open:
 http://192.168.1.30:8788
 ```
 
-For the existing sample file, click `导入 demo.mp4`.
-
 Reprocessing writes a new version first and only replaces the active audio and transcript after the full pipeline succeeds. If extraction or transcription fails, the previous playable version is preserved.
 
 Useful commands:
