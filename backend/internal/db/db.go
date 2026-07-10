@@ -34,6 +34,26 @@ type Segment struct {
 	Text   string  `json:"text"`
 }
 
+type ClipListQuery struct {
+	Query  string
+	Status string
+	Limit  int
+	Offset int
+}
+
+type ClipCounts struct {
+	All        int `json:"all"`
+	Ready      int `json:"ready"`
+	Processing int `json:"processing"`
+	Error      int `json:"error"`
+}
+
+type ClipListResult struct {
+	Clips  []Clip
+	Total  int
+	Counts ClipCounts
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	database, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -229,6 +249,79 @@ func (s *Store) ListClips(ctx context.Context) ([]Clip, error) {
 		return nil, err
 	}
 	return clips, nil
+}
+
+func (s *Store) QueryClips(ctx context.Context, query ClipListQuery) (ClipListResult, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ClipListResult{}, err
+	}
+	defer tx.Rollback()
+
+	const searchCondition = `(? = '' OR instr(lower(title), lower(?)) > 0 OR instr(lower(language), lower(?)) > 0)`
+	searchArgs := []any{query.Query, query.Query, query.Query}
+	result := ClipListResult{Clips: []Clip{}}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0)
+		FROM clips
+		WHERE `+searchCondition,
+		searchArgs...,
+	).Scan(&result.Counts.All, &result.Counts.Ready, &result.Counts.Processing, &result.Counts.Error); err != nil {
+		return ClipListResult{}, err
+	}
+
+	statusFilter := query.Status != "" && query.Status != "all"
+	result.Total = result.Counts.All
+	if statusFilter {
+		totalArgs := append(append([]any{}, searchArgs...), query.Status)
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM clips
+			WHERE `+searchCondition+` AND status = ?`,
+			totalArgs...,
+		).Scan(&result.Total); err != nil {
+			return ClipListResult{}, err
+		}
+	}
+
+	listQuery := `
+		SELECT id, title, source_path, source_hash, audio_path, duration, language, status, error, created_at
+		FROM clips
+		WHERE ` + searchCondition
+	listArgs := append([]any{}, searchArgs...)
+	if statusFilter {
+		listQuery += ` AND status = ?`
+		listArgs = append(listArgs, query.Status)
+	}
+	listQuery += ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+	listArgs = append(listArgs, query.Limit, query.Offset)
+	rows, err := tx.QueryContext(ctx, listQuery, listArgs...)
+	if err != nil {
+		return ClipListResult{}, err
+	}
+	for rows.Next() {
+		clip, err := scanClip(rows)
+		if err != nil {
+			_ = rows.Close()
+			return ClipListResult{}, err
+		}
+		result.Clips = append(result.Clips, clip)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return ClipListResult{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return ClipListResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ClipListResult{}, err
+	}
+	return result, nil
 }
 
 func (s *Store) GetClipBySourceHash(ctx context.Context, sourceHash string) (Clip, []Segment, error) {

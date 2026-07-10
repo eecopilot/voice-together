@@ -1,16 +1,16 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react'
 import { Headphones, Loader2, MoreVertical, Pause, Play, RefreshCw, Repeat, Search, SkipBack, SkipForward, Trash2, Upload } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Card, CardBody, CardHeader } from './components/ui/card'
 import { Select } from './components/ui/select'
 import { deleteClip, getClip, importDemo, listClips, reprocessClip, uploadClip } from './lib/api'
 import { cn, formatTime } from './lib/utils'
-import type { Clip, ClipDetail } from './types'
+import type { Clip, ClipCounts, ClipDetail, ClipFilter, ClipListResponse } from './types'
 
 const speeds = [0.75, 1, 1.25]
 const clipPageSize = 10
-
-type ClipFilter = 'all' | Clip['status']
+const clipSearchDebounceMs = 250
+const emptyClipCounts: ClipCounts = { all: 0, ready: 0, processing: 0, error: 0 }
 
 const clipFilterOptions: Array<{ value: ClipFilter; label: string }> = [
   { value: 'all', label: '全部' },
@@ -29,7 +29,11 @@ function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const openRequestIdRef = useRef(0)
+  const listRequestIdRef = useRef(0)
+  const activeClipQueryRef = useRef<{ query: string; filter: ClipFilter }>({ query: '', filter: 'all' })
   const [clips, setClips] = useState<Clip[]>([])
+  const [clipTotal, setClipTotal] = useState(0)
+  const [clipCounts, setClipCounts] = useState<ClipCounts>(emptyClipCounts)
   const [detail, setDetail] = useState<ClipDetail | null>(null)
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null)
   const [loop, setLoop] = useState(true)
@@ -44,7 +48,8 @@ function App() {
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
   const [clipQuery, setClipQuery] = useState('')
   const [clipFilter, setClipFilter] = useState<ClipFilter>('all')
-  const [visibleClipLimit, setVisibleClipLimit] = useState(clipPageSize)
+  const [isClipSearchLoading, setIsClipSearchLoading] = useState(true)
+  const [isLoadingMoreClips, setIsLoadingMoreClips] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
 
@@ -55,8 +60,17 @@ function App() {
   const progressPercent = effectiveDuration > 0 ? (seekValue / effectiveDuration) * 100 : 0
 
   useEffect(() => {
-    void refreshClips(true)
-  }, [])
+    listRequestIdRef.current += 1
+    setIsClipSearchLoading(true)
+    setIsLoadingMoreClips(false)
+    const timer = window.setTimeout(() => {
+      const nextQuery = clipQuery.trim()
+      const nextFilter = clipFilter
+      activeClipQueryRef.current = { query: nextQuery, filter: nextFilter }
+      void refreshClips({ query: nextQuery, filter: nextFilter, openPreferredIfEmpty: true })
+    }, clipSearchDebounceMs)
+    return () => window.clearTimeout(timer)
+  }, [clipFilter, clipQuery])
 
   useEffect(() => {
     if (audioRef.current) {
@@ -69,45 +83,59 @@ function App() {
   const currentSegment = currentIndex === null ? null : segments[currentIndex] ?? null
   const loopSegment = selectedIndex === null ? currentSegment : segments[selectedIndex] ?? currentSegment
   const totalSegments = segments.length
-  const readyClips = useMemo(() => clips.filter((clip) => clip.status === 'ready').length, [clips])
-  const clipStats = useMemo(
-    () =>
-      clips.reduce<Record<ClipFilter, number>>(
-        (stats, clip) => {
-          stats.all += 1
-          stats[clip.status] += 1
-          return stats
-        },
-        { all: 0, ready: 0, processing: 0, error: 0 }
-      ),
-    [clips]
-  )
-  const visibleClips = useMemo(() => {
-    const query = clipQuery.trim().toLowerCase()
-    return clips.filter((clip) => {
-      if (clipFilter !== 'all' && clip.status !== clipFilter) {
-        return false
-      }
-      if (!query) {
-        return true
-      }
-      const searchable = [clip.title, clip.language, statusLabels[clip.status], clip.status].join(' ').toLowerCase()
-      return searchable.includes(query)
-    })
-  }, [clipFilter, clipQuery, clips])
-  const displayedClips = visibleClips.slice(0, visibleClipLimit)
-  const hasMoreClips = visibleClips.length > displayedClips.length
+  const readyClips = clipCounts.ready
+  const hasMoreClips = clips.length < clipTotal
 
-  async function refreshClips(openPreferredIfEmpty = false) {
+  async function refreshClips({
+    query = activeClipQueryRef.current.query,
+    filter = activeClipQueryRef.current.filter,
+    append = false,
+    openPreferredIfEmpty = false
+  }: {
+    query?: string
+    filter?: ClipFilter
+    append?: boolean
+    openPreferredIfEmpty?: boolean
+  } = {}): Promise<ClipListResponse | null> {
+    const requestId = ++listRequestIdRef.current
+    const offset = append ? clips.length : 0
+    if (append) {
+      setIsLoadingMoreClips(true)
+    } else {
+      setIsClipSearchLoading(true)
+      setIsLoadingMoreClips(false)
+    }
     try {
-      const next = await listClips()
-      setClips(next)
-      if (openPreferredIfEmpty && !detail && next.length > 0) {
-        const preferredClip = next.find((clip) => clip.status === 'ready') ?? next[0]
+      const response = await listClips({
+        q: query || undefined,
+        status: filter === 'all' ? undefined : filter,
+        limit: clipPageSize,
+        offset
+      })
+      if (requestId !== listRequestIdRef.current) {
+        return null
+      }
+      setClips((current) => (append ? appendUniqueClips(current, response.clips) : response.clips))
+      setClipTotal(response.total)
+      setClipCounts(response.counts)
+      if (openPreferredIfEmpty && !detail && response.clips.length > 0) {
+        const preferredClip = response.clips.find((clip) => clip.status === 'ready') ?? response.clips[0]
         await openClip(preferredClip.id)
       }
+      return response
     } catch (err) {
-      setError(errorMessage(err))
+      if (requestId === listRequestIdRef.current) {
+        setError(errorMessage(err))
+      }
+      return null
+    } finally {
+      if (requestId === listRequestIdRef.current) {
+        if (append) {
+          setIsLoadingMoreClips(false)
+        } else {
+          setIsClipSearchLoading(false)
+        }
+      }
     }
   }
 
@@ -215,10 +243,14 @@ function App() {
         setIsPlaying(false)
         resetPlaybackState()
       }
-      const nextClips = await listClips()
-      setClips(nextClips)
+      const response = await refreshClips()
       if (isDeletingCurrentClip) {
-        const preferredClip = nextClips.find((item) => item.status === 'ready') ?? nextClips[0]
+        let preferredClip = response?.clips.find((item) => item.status === 'ready') ?? response?.clips[0]
+        const activeQuery = activeClipQueryRef.current
+        if (!preferredClip && (activeQuery.query || activeQuery.filter !== 'all')) {
+          const fallback = await listClips({ limit: clipPageSize, offset: 0 })
+          preferredClip = fallback.clips.find((item) => item.status === 'ready') ?? fallback.clips[0]
+        }
         if (preferredClip) {
           await openClip(preferredClip.id)
         }
@@ -233,6 +265,12 @@ function App() {
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     setFile(event.target.files?.[0] ?? null)
     setNotice('')
+  }
+
+  function invalidateClipListForSearch() {
+    listRequestIdRef.current += 1
+    setIsClipSearchLoading(true)
+    setIsLoadingMoreClips(false)
   }
 
   function applyDetail(next: ClipDetail, invalidatePendingOpen = true) {
@@ -384,18 +422,20 @@ function App() {
             <CardHeader className="grid gap-3">
               <div className="flex items-center justify-between gap-3">
                 <h2 className="text-sm font-bold">片段库</h2>
-                <span className="shrink-0 text-xs font-semibold text-muted">
-                  {displayedClips.length}/{visibleClips.length}
+                <span className="shrink-0 text-xs font-semibold text-muted" role="status" aria-live="polite">
+                  {isClipSearchLoading ? '搜索中…' : `${clips.length}/${clipTotal}`}
                 </span>
               </div>
               <label className="flex h-9 min-w-0 items-center gap-2 rounded-md border border-border bg-white px-3 text-muted">
-                <Search size={15} />
+                {isClipSearchLoading ? <Loader2 className="animate-spin" size={15} /> : <Search size={15} />}
                 <input
                   className="min-w-0 flex-1 bg-transparent text-sm font-medium text-slate-900 outline-none placeholder:text-muted"
                   value={clipQuery}
                   onChange={(event) => {
-                    setClipQuery(event.target.value)
-                    setVisibleClipLimit(clipPageSize)
+                    const nextQuery = event.target.value
+                    invalidateClipListForSearch()
+                    activeClipQueryRef.current = { query: nextQuery.trim(), filter: clipFilter }
+                    setClipQuery(nextQuery)
                     setOpenMenuId(null)
                   }}
                   placeholder="搜索标题或语言"
@@ -412,25 +452,33 @@ function App() {
                     )}
                     type="button"
                     onClick={() => {
-                      setClipFilter(option.value)
-                      setVisibleClipLimit(clipPageSize)
+                      if (option.value !== clipFilter) {
+                        invalidateClipListForSearch()
+                        activeClipQueryRef.current = { query: clipQuery.trim(), filter: option.value }
+                        setClipFilter(option.value)
+                      }
                       setOpenMenuId(null)
                     }}
                     aria-pressed={clipFilter === option.value}
                   >
-                    {option.label} {clipStats[option.value]}
+                    {option.label} {clipCounts[option.value]}
                   </button>
                 ))}
               </div>
             </CardHeader>
-            <CardBody className="min-h-0 overflow-y-auto p-3">
-              {clips.length === 0 ? (
+            <CardBody className="min-h-0 overflow-y-auto p-3" aria-busy={isClipSearchLoading || isLoadingMoreClips}>
+              {isClipSearchLoading && clips.length === 0 ? (
+                <p className="flex items-center gap-2 px-2 py-6 text-sm text-muted">
+                  <Loader2 className="animate-spin" size={15} />
+                  正在搜索片段…
+                </p>
+              ) : clipTotal === 0 && !clipQuery.trim() && clipFilter === 'all' ? (
                 <p className="px-2 py-6 text-sm text-muted">还没有导入片段。</p>
-              ) : displayedClips.length === 0 ? (
+              ) : clips.length === 0 ? (
                 <p className="px-2 py-6 text-sm text-muted">没有匹配的片段。</p>
               ) : (
                 <div className="grid gap-2">
-                  {displayedClips.map((clip) => (
+                  {clips.map((clip) => (
                     <article
                       key={clip.id}
                       className={cn(
@@ -503,9 +551,11 @@ function App() {
                     <Button
                       className="w-full"
                       type="button"
-                      onClick={() => setVisibleClipLimit((limit) => Math.min(limit + clipPageSize, visibleClips.length))}
+                      onClick={() => void refreshClips({ append: true })}
+                      disabled={isLoadingMoreClips || isClipSearchLoading}
                     >
-                      显示更多（剩余 {visibleClips.length - displayedClips.length} 个）
+                      {isLoadingMoreClips ? <Loader2 className="animate-spin" size={16} /> : null}
+                      显示更多（剩余 {clipTotal - clips.length} 个）
                     </Button>
                   ) : null}
                 </div>
@@ -675,6 +725,11 @@ function normalizeDetail(detail: ClipDetail): ClipDetail {
     ...detail,
     segments: Array.isArray(detail.segments) ? detail.segments : []
   }
+}
+
+function appendUniqueClips(current: Clip[], next: Clip[]) {
+  const existingIds = new Set(current.map((clip) => clip.id))
+  return [...current, ...next.filter((clip) => !existingIds.has(clip.id))]
 }
 
 export default App

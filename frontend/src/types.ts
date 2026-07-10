@@ -1,3 +1,5 @@
+export type ClipStatus = 'processing' | 'ready' | 'error'
+
 export type Clip = {
   id: string
   title: string
@@ -6,9 +8,28 @@ export type Clip = {
   audio_path: string
   duration: number
   language: string
-  status: 'processing' | 'ready' | 'error'
+  status: ClipStatus
   error: string
   created_at: string
+}
+
+export type ClipFilter = 'all' | ClipStatus
+
+export type ClipCounts = Record<ClipFilter, number>
+
+export type ClipListParams = {
+  q?: string
+  status?: ClipStatus
+  limit?: number
+  offset?: number
+}
+
+export type ClipListResponse = {
+  clips: Clip[]
+  total: number
+  limit: number
+  offset: number
+  counts: ClipCounts
 }
 
 export type Segment = {

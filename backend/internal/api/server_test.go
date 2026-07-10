@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"mime/multipart"
 	"net/http"
@@ -17,6 +18,14 @@ import (
 	"voice-together/backend/internal/storage"
 	"voice-together/backend/internal/transcribe"
 )
+
+type clipListPayload struct {
+	Clips  []db.Clip     `json:"clips"`
+	Total  int           `json:"total"`
+	Limit  int           `json:"limit"`
+	Offset int           `json:"offset"`
+	Counts db.ClipCounts `json:"counts"`
+}
 
 type fakeMediaProcessor struct {
 	extract func(context.Context, string, string) (media.Result, error)
@@ -38,6 +47,72 @@ func (f fakeTranscriber) Transcribe(ctx context.Context, audioPath string, langu
 		return transcribe.Result{}, errors.New("unexpected transcription")
 	}
 	return f.transcribe(ctx, audioPath, language)
+}
+
+func TestListClipsSearchStatusPaginationAndCounts(t *testing.T) {
+	server, store, _ := newTestServer(t, fakeMediaProcessor{}, fakeTranscriber{})
+	seedClipList(t, store)
+
+	t.Run("title search and status", func(t *testing.T) {
+		payload := requestClipList(t, server, "/api/clips?q=ALPHA&status=ready&limit=5&offset=0")
+		if payload.Total != 1 || payload.Limit != 5 || payload.Offset != 0 {
+			t.Fatalf("unexpected page metadata: %#v", payload)
+		}
+		if len(payload.Clips) != 1 || payload.Clips[0].ID != "alpha-ready" {
+			t.Fatalf("unexpected clips: %#v", payload.Clips)
+		}
+		wantCounts := db.ClipCounts{All: 2, Ready: 1, Processing: 1, Error: 0}
+		if payload.Counts != wantCounts {
+			t.Fatalf("counts = %#v, want %#v", payload.Counts, wantCounts)
+		}
+	})
+
+	t.Run("language search and pagination", func(t *testing.T) {
+		payload := requestClipList(t, server, "/api/clips?q=eN&limit=1&offset=1")
+		if payload.Total != 2 || payload.Limit != 1 || payload.Offset != 1 {
+			t.Fatalf("unexpected page metadata: %#v", payload)
+		}
+		if len(payload.Clips) != 1 || payload.Clips[0].ID != "alpha-ready" {
+			t.Fatalf("unexpected clips: %#v", payload.Clips)
+		}
+		wantCounts := db.ClipCounts{All: 2, Ready: 1, Processing: 0, Error: 1}
+		if payload.Counts != wantCounts {
+			t.Fatalf("counts = %#v, want %#v", payload.Counts, wantCounts)
+		}
+	})
+
+	t.Run("status ignores filter for counts", func(t *testing.T) {
+		payload := requestClipList(t, server, "/api/clips?status=ready")
+		if payload.Total != 2 || payload.Limit != 10 || payload.Offset != 0 || len(payload.Clips) != 2 {
+			t.Fatalf("unexpected ready page: %#v", payload)
+		}
+		wantCounts := db.ClipCounts{All: 4, Ready: 2, Processing: 1, Error: 1}
+		if payload.Counts != wantCounts {
+			t.Fatalf("counts = %#v, want %#v", payload.Counts, wantCounts)
+		}
+	})
+}
+
+func TestListClipsRejectsInvalidParameters(t *testing.T) {
+	server, _, _ := newTestServer(t, fakeMediaProcessor{}, fakeTranscriber{})
+	tests := []string{
+		"/api/clips?status=unknown",
+		"/api/clips?limit=0",
+		"/api/clips?limit=101",
+		"/api/clips?limit=abc",
+		"/api/clips?offset=-1",
+		"/api/clips?offset=abc",
+	}
+	for _, target := range tests {
+		t.Run(target, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, target, nil)
+			response := httptest.NewRecorder()
+			server.Routes().ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+			}
+		})
+	}
 }
 
 func TestUploadRejectsUnsupportedExtension(t *testing.T) {
@@ -289,6 +364,37 @@ func newTestServer(t *testing.T, mediaProcessor MediaProcessor, transcriber Tran
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return New(store, paths, mediaProcessor, transcriber, nil), store, paths
+}
+
+func seedClipList(t *testing.T, store *db.Store) {
+	t.Helper()
+	base := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+	clips := []db.Clip{
+		{ID: "alpha-ready", Title: "Alpha Lesson", SourcePath: "/tmp/alpha-ready.mp3", Language: "en", Status: "ready", CreatedAt: base.Add(time.Second)},
+		{ID: "alpha-processing", Title: "alpha practice", SourcePath: "/tmp/alpha-processing.mp3", Language: "fr", Status: "processing", CreatedAt: base.Add(2 * time.Second)},
+		{ID: "beta-error", Title: "Beta", SourcePath: "/tmp/beta-error.mp3", Language: "EN", Status: "error", CreatedAt: base.Add(3 * time.Second)},
+		{ID: "gamma-ready", Title: "Gamma", SourcePath: "/tmp/gamma-ready.mp3", Language: "de", Status: "ready", CreatedAt: base.Add(4 * time.Second)},
+	}
+	for _, clip := range clips {
+		if err := store.CreateClip(context.Background(), clip); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func requestClipList(t *testing.T, server *Server, target string) clipListPayload {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, target, nil)
+	response := httptest.NewRecorder()
+	server.Routes().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	var payload clipListPayload
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 func multipartUpload(t *testing.T, filename string, data []byte) (*bytes.Buffer, string) {

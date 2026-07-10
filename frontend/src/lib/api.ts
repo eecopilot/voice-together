@@ -1,4 +1,4 @@
-import type { Clip, ClipDetail } from '../types'
+import type { ClipDetail, ClipListParams, ClipListResponse } from '../types'
 
 async function readJSON<T>(response: Response): Promise<T> {
   const text = await response.text()
@@ -9,10 +9,23 @@ async function readJSON<T>(response: Response): Promise<T> {
   return data as T
 }
 
-export async function listClips(): Promise<Clip[]> {
-  const response = await fetch('/api/clips')
-  const data = await readJSON<{ clips: Clip[] }>(response)
-  return data.clips
+export async function listClips(params: ClipListParams = {}): Promise<ClipListResponse> {
+  const search = new URLSearchParams()
+  if (params.q) {
+    search.set('q', params.q)
+  }
+  if (params.status) {
+    search.set('status', params.status)
+  }
+  if (params.limit !== undefined) {
+    search.set('limit', String(params.limit))
+  }
+  if (params.offset !== undefined) {
+    search.set('offset', String(params.offset))
+  }
+  const query = search.toString()
+  const response = await fetch(`/api/clips${query ? `?${query}` : ''}`)
+  return readJSON<ClipListResponse>(response)
 }
 
 export async function getClip(id: string): Promise<ClipDetail> {

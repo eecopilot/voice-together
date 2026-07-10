@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,17 +124,63 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		clips, err := s.store.ListClips(r.Context())
+		query, err := parseClipListQuery(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		result, err := s.store.QueryClips(r.Context(), query)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"clips": clips})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"clips":  result.Clips,
+			"total":  result.Total,
+			"limit":  query.Limit,
+			"offset": query.Offset,
+			"counts": result.Counts,
+		})
 	case http.MethodPost:
 		s.handleUpload(w, r)
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func parseClipListQuery(r *http.Request) (db.ClipListQuery, error) {
+	values := r.URL.Query()
+	status := strings.TrimSpace(values.Get("status"))
+	switch status {
+	case "", "all", "ready", "processing", "error":
+	default:
+		return db.ClipListQuery{}, errors.New("invalid status")
+	}
+	limit, err := parseQueryInteger(values.Get("limit"), 10, 1, 100, "limit")
+	if err != nil {
+		return db.ClipListQuery{}, err
+	}
+	offset, err := parseQueryInteger(values.Get("offset"), 0, 0, -1, "offset")
+	if err != nil {
+		return db.ClipListQuery{}, err
+	}
+	return db.ClipListQuery{
+		Query:  strings.TrimSpace(values.Get("q")),
+		Status: status,
+		Limit:  limit,
+		Offset: offset,
+	}, nil
+}
+
+func parseQueryInteger(raw string, defaultValue int, minimum int, maximum int, name string) (int, error) {
+	if raw == "" {
+		return defaultValue, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || (maximum >= 0 && value > maximum) {
+		return 0, fmt.Errorf("invalid %s", name)
+	}
+	return value, nil
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
