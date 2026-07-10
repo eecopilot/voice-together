@@ -11,12 +11,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"voice-together/backend/internal/db"
@@ -25,12 +27,49 @@ import (
 	"voice-together/backend/internal/transcribe"
 )
 
+const maxUploadBytes int64 = 500 << 20
+
+var errUnsupportedMedia = errors.New("unsupported media type")
+
+type MediaProcessor interface {
+	Extract(context.Context, string, string) (media.Result, error)
+}
+
+type Transcriber interface {
+	Transcribe(context.Context, string, string) (transcribe.Result, error)
+}
+
+type keyedLocks struct {
+	mu   sync.Mutex
+	held map[string]struct{}
+}
+
+func newKeyedLocks() *keyedLocks {
+	return &keyedLocks{held: make(map[string]struct{})}
+}
+
+func (l *keyedLocks) tryLock(key string) (func(), bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, exists := l.held[key]; exists {
+		return nil, false
+	}
+	l.held[key] = struct{}{}
+	return func() {
+		l.mu.Lock()
+		delete(l.held, key)
+		l.mu.Unlock()
+	}, true
+}
+
 type Server struct {
 	store      *db.Store
 	paths      storage.Paths
-	media      media.Processor
-	transcribe transcribe.Service
+	media      MediaProcessor
+	transcribe Transcriber
 	staticFS   fs.FS
+	processing chan struct{}
+	clipLocks  *keyedLocks
 }
 
 type clipResponse struct {
@@ -39,13 +78,24 @@ type clipResponse struct {
 	Reused   bool         `json:"reused,omitempty"`
 }
 
-func New(store *db.Store, paths storage.Paths, mediaProcessor media.Processor, transcriber transcribe.Service, staticFS fs.FS) *Server {
+func New(store *db.Store, paths storage.Paths, mediaProcessor MediaProcessor, transcriber Transcriber, staticFS fs.FS) *Server {
 	return &Server{
 		store:      store,
 		paths:      paths,
 		media:      mediaProcessor,
 		transcribe: transcriber,
 		staticFS:   staticFS,
+		processing: make(chan struct{}, 1),
+		clipLocks:  newKeyedLocks(),
+	}
+}
+
+func (s *Server) tryStartProcessing() (func(), bool) {
+	select {
+	case s.processing <- struct{}{}:
+		return func() { <-s.processing }, true
+	default:
+		return nil, false
 	}
 }
 
@@ -87,11 +137,24 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 500<<20)
+	finishProcessing, ok := s.tryStartProcessing()
+	if !ok {
+		writeError(w, http.StatusConflict, errors.New("media processing is busy"))
+		return
+	}
+	defer finishProcessing()
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusRequestEntityTooLarge, errors.New("upload is too large"))
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -99,6 +162,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	if _, err := safeExt(header.Filename); err != nil {
+		writeError(w, http.StatusUnsupportedMediaType, err)
+		return
+	}
 
 	title := strings.TrimSpace(r.FormValue("title"))
 	if title == "" {
@@ -108,6 +175,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	response, err := s.importMultipart(r.Context(), file, header, title, language)
 	if err != nil {
+		if errors.Is(err, errUnsupportedMedia) {
+			writeError(w, http.StatusUnsupportedMediaType, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -123,6 +194,12 @@ func (s *Server) handleDemoImport(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	finishProcessing, ok := s.tryStartProcessing()
+	if !ok {
+		writeError(w, http.StatusConflict, errors.New("media processing is busy"))
+		return
+	}
+	defer finishProcessing()
 
 	demoPath := filepath.Join(s.paths.ProjectRoot, "demo.mp4")
 	if _, err := os.Stat(demoPath); err != nil {
@@ -183,7 +260,26 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, clipResponse{Clip: clip, Segments: segments})
 	case http.MethodDelete:
 		clip, _, err := s.store.GetClip(r.Context(), clipID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("clip not found"))
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		unlock, ok := s.clipLocks.tryLock(clipID)
+		if !ok {
+			writeError(w, http.StatusConflict, errors.New("clip is busy"))
+			return
+		}
+		defer unlock()
+		clip, _, err = s.store.GetClip(r.Context(), clipID)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("clip not found"))
+			return
+		}
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -202,6 +298,20 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request, clipID string) {
+	finishProcessing, ok := s.tryStartProcessing()
+	if !ok {
+		writeError(w, http.StatusConflict, errors.New("media processing is busy"))
+		return
+	}
+	defer finishProcessing()
+
+	unlock, ok := s.clipLocks.tryLock(clipID)
+	if !ok {
+		writeError(w, http.StatusConflict, errors.New("clip is busy"))
+		return
+	}
+	defer unlock()
+
 	clip, _, err := s.store.GetClip(r.Context(), clipID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -227,7 +337,7 @@ func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request, clipID 
 		}
 	}
 
-	response, err := s.processExistingSource(r.Context(), clip.ID, clip.SourcePath, clip.Language)
+	response, err := s.processExistingSource(r.Context(), clip, true)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -325,7 +435,10 @@ func setStaticCacheHeader(w http.ResponseWriter, requestedPath string) {
 
 func (s *Server) importMultipart(ctx context.Context, file multipart.File, header *multipart.FileHeader, title string, language string) (clipResponse, error) {
 	id := newID()
-	ext := safeExt(header.Filename)
+	ext, err := safeExt(header.Filename)
+	if err != nil {
+		return clipResponse{}, err
+	}
 	sourcePath := filepath.Join(s.paths.UploadsDir, id+ext)
 	sourceHash, err := writeFileAndHash(sourcePath, file)
 	if err != nil {
@@ -344,7 +457,10 @@ func (s *Server) importMultipart(ctx context.Context, file multipart.File, heade
 
 func (s *Server) importLocalFile(ctx context.Context, sourcePath string, title string, language string) (clipResponse, error) {
 	id := newID()
-	ext := safeExt(sourcePath)
+	ext, err := safeExt(sourcePath)
+	if err != nil {
+		return clipResponse{}, err
+	}
 	savedPath := filepath.Join(s.paths.UploadsDir, id+ext)
 	source, err := os.Open(sourcePath)
 	if err != nil {
@@ -367,6 +483,12 @@ func (s *Server) importLocalFile(ctx context.Context, sourcePath string, title s
 }
 
 func (s *Server) processSource(ctx context.Context, id string, title string, sourcePath string, sourceHash string, language string) (clipResponse, error) {
+	unlock, ok := s.clipLocks.tryLock(id)
+	if !ok {
+		return clipResponse{}, errors.New("clip is busy")
+	}
+	defer unlock()
+
 	now := time.Now()
 	clip := db.Clip{
 		ID:         id,
@@ -378,53 +500,93 @@ func (s *Server) processSource(ctx context.Context, id string, title string, sou
 		CreatedAt:  now,
 	}
 	if err := s.store.CreateClip(ctx, clip); err != nil {
+		_ = os.Remove(sourcePath)
 		return clipResponse{}, err
 	}
-	return s.processExistingSource(ctx, id, sourcePath, language)
+	return s.processExistingSource(ctx, clip, false)
 }
 
-func (s *Server) processExistingSource(ctx context.Context, id string, sourcePath string, language string) (clipResponse, error) {
-	if err := s.store.MarkClipProcessing(ctx, id); err != nil {
-		return clipResponse{}, err
-	}
-	if err := s.store.ReplaceSegments(ctx, id, []db.Segment{}); err != nil {
-		return clipResponse{}, err
-	}
+func (s *Server) processExistingSource(ctx context.Context, clip db.Clip, preserveExisting bool) (clipResponse, error) {
+	runDir := filepath.Join(s.paths.ClipsDir, clip.ID, "runs", newID())
+	removeRun := true
+	defer func() {
+		if removeRun {
+			_ = os.RemoveAll(runDir)
+		}
+	}()
 
-	clipDir := filepath.Join(s.paths.ClipsDir, id)
-	_ = os.RemoveAll(clipDir)
-	mediaResult, err := s.media.Extract(ctx, sourcePath, clipDir)
+	mediaResult, err := s.media.Extract(ctx, clip.SourcePath, runDir)
 	if err != nil {
-		_ = s.store.UpdateClipProcessed(ctx, id, "", 0, language, "error", err.Error())
+		if !preserveExisting {
+			_ = s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", err.Error())
+		}
 		return clipResponse{}, err
 	}
+	defer os.Remove(mediaResult.TranscriptionWAVPath)
 
-	transcribeResult, err := s.transcribe.Transcribe(ctx, mediaResult.TranscriptionWAVPath, language)
+	transcribeResult, err := s.transcribe.Transcribe(ctx, mediaResult.TranscriptionWAVPath, clip.Language)
 	if err != nil {
-		_ = s.store.UpdateClipProcessed(ctx, id, mediaResult.BrowserAudioPath, 0, language, "error", err.Error())
+		if !preserveExisting {
+			_ = s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", err.Error())
+		}
 		return clipResponse{}, err
 	}
 
 	for index := range transcribeResult.Segments {
-		transcribeResult.Segments[index].ClipID = id
-	}
-	if err := s.store.ReplaceSegments(ctx, id, transcribeResult.Segments); err != nil {
-		return clipResponse{}, err
+		transcribeResult.Segments[index].ClipID = clip.ID
 	}
 
-	finalLanguage := language
+	finalLanguage := clip.Language
 	if finalLanguage == "" {
 		finalLanguage = transcribeResult.Language
 	}
-	if err := s.store.UpdateClipProcessed(ctx, id, mediaResult.BrowserAudioPath, transcribeResult.Duration, finalLanguage, "ready", transcribeResult.Warning); err != nil {
+	if err := s.store.CompleteClipProcessing(
+		ctx,
+		clip.ID,
+		mediaResult.BrowserAudioPath,
+		transcribeResult.Duration,
+		finalLanguage,
+		"ready",
+		transcribeResult.Warning,
+		transcribeResult.Segments,
+	); err != nil {
+		if !preserveExisting {
+			_ = s.store.UpdateClipProcessed(ctx, clip.ID, "", 0, clip.Language, "error", err.Error())
+		}
 		return clipResponse{}, err
 	}
+	removeRun = false
+	s.cleanupOldMedia(clip, runDir)
 
-	readyClip, segments, err := s.store.GetClip(ctx, id)
+	readyClip, segments, err := s.store.GetClip(ctx, clip.ID)
 	if err != nil {
 		return clipResponse{}, err
 	}
 	return clipResponse{Clip: readyClip, Segments: segments}, nil
+}
+
+func (s *Server) cleanupOldMedia(clip db.Clip, newRunDir string) {
+	if clip.AudioPath == "" {
+		return
+	}
+	clipDir := filepath.Join(s.paths.ClipsDir, clip.ID)
+	oldDir := filepath.Dir(clip.AudioPath)
+	if oldDir == clipDir {
+		for _, filename := range []string{"audio.mp3", "transcribe.wav"} {
+			if err := os.Remove(filepath.Join(clipDir, filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Printf("clean old clip media: %v", err)
+			}
+		}
+		return
+	}
+	runsDir := filepath.Join(clipDir, "runs")
+	rel, err := filepath.Rel(runsDir, oldDir)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") || oldDir == newRunDir {
+		return
+	}
+	if err := os.RemoveAll(oldDir); err != nil {
+		log.Printf("clean old clip run: %v", err)
+	}
 }
 
 func (s *Server) findExistingByHash(ctx context.Context, sourceHash string) (clipResponse, bool, error) {
@@ -487,20 +649,30 @@ func writeFile(path string, source io.Reader) error {
 	return err
 }
 
-func writeFileAndHash(path string, source io.Reader) (string, error) {
+func writeFileAndHash(path string, source io.Reader) (hash string, err error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	destination, err := os.Create(path)
+	destination, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", err
 	}
-	defer destination.Close()
+	complete := false
+	defer func() {
+		if !complete {
+			_ = os.Remove(path)
+		}
+	}()
 
 	hasher := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(destination, hasher), source); err != nil {
+		_ = destination.Close()
 		return "", err
 	}
+	if err := destination.Close(); err != nil {
+		return "", err
+	}
+	complete = true
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
@@ -518,13 +690,13 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func safeExt(filename string) string {
+func safeExt(filename string) (string, error) {
 	ext := strings.ToLower(filepath.Ext(filename))
 	switch ext {
 	case ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".mp3", ".m4a", ".wav":
-		return ext
+		return ext, nil
 	default:
-		return ".bin"
+		return "", fmt.Errorf("%w: %q", errUnsupportedMedia, ext)
 	}
 }
 

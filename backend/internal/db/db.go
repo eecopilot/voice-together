@@ -129,6 +129,57 @@ func (s *Store) UpdateClipProcessed(ctx context.Context, id string, audioPath st
 	return err
 }
 
+func (s *Store) CompleteClipProcessing(
+	ctx context.Context,
+	id string,
+	audioPath string,
+	duration float64,
+	language string,
+	status string,
+	errText string,
+	segments []Segment,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM segments WHERE clip_id = ?`, id); err != nil {
+		return err
+	}
+	statement, err := tx.PrepareContext(ctx, `INSERT INTO segments (clip_id, start, end, text) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	for _, segment := range segments {
+		if _, err := statement.ExecContext(ctx, id, segment.Start, segment.End, segment.Text); err != nil {
+			_ = statement.Close()
+			return err
+		}
+	}
+	if err := statement.Close(); err != nil {
+		return err
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE clips
+		SET audio_path = ?, duration = ?, language = ?, status = ?, error = ?
+		WHERE id = ?
+	`, audioPath, duration, language, status, errText, id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected != 1 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ReplaceSegments(ctx context.Context, clipID string, segments []Segment) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
