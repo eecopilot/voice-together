@@ -27,8 +27,113 @@ const statusLabels: Record<Clip['status'], string> = {
   error: '失败'
 }
 
+type MediaTarget = 'audio' | 'video'
+type PlaybackSegment = ClipDetail['segments'][number]
+
+type PlaybackPanelProps = {
+  currentTime: number
+  duration: number
+  progressPercent: number
+  currentSegment: PlaybackSegment | null
+  isPlaying: boolean
+  loop: boolean
+  speed: number
+  mediaAvailable: boolean
+  hasSegments: boolean
+  canPrevious: boolean
+  canNext: boolean
+  canLoopCurrent: boolean
+  dark?: boolean
+  onSeek: (value: number) => void
+  onPrevious: () => void
+  onTogglePlay: () => void
+  onNext: () => void
+  onToggleLoop: () => void
+  onSpeedChange: (value: number) => void
+}
+
+function PlaybackPanel({
+  currentTime,
+  duration,
+  progressPercent,
+  currentSegment,
+  isPlaying,
+  loop,
+  speed,
+  mediaAvailable,
+  hasSegments,
+  canPrevious,
+  canNext,
+  canLoopCurrent,
+  dark = false,
+  onSeek,
+  onPrevious,
+  onTogglePlay,
+  onNext,
+  onToggleLoop,
+  onSpeedChange
+}: PlaybackPanelProps) {
+  return (
+    <div className={cn('grid gap-3 rounded-lg p-3 sm:p-4', dark ? 'border border-white/10 bg-white/5' : 'bg-slate-50/90')}>
+      <div className="grid min-w-0 gap-1.5">
+        <div className={cn('flex items-center justify-between gap-3 text-xs font-semibold', dark ? 'text-slate-300' : 'text-muted')}>
+          <span className="font-mono">{formatTime(currentTime)}</span>
+          <span className="font-mono">{formatTime(duration)}</span>
+        </div>
+        <input
+          className="player-range"
+          type="range"
+          min={0}
+          max={Math.max(duration, 0)}
+          step={0.05}
+          value={currentTime}
+          onChange={(event) => onSeek(Number(event.target.value))}
+          disabled={!mediaAvailable || duration <= 0}
+          style={{
+            background: `linear-gradient(to right, #0f766e 0%, #0f766e ${progressPercent}%, #cbd5e1 ${progressPercent}%, #cbd5e1 100%)`
+          }}
+          aria-label="播放进度"
+        />
+      </div>
+
+      {currentSegment ? (
+        <div className={cn('rounded-md border px-3 py-2.5 sm:px-4 sm:py-3', dark ? 'border-white/10 bg-white/10' : 'border-teal-100 bg-white')}>
+          <p className={cn('text-base font-semibold leading-7', dark ? 'text-white' : 'text-slate-950')}>{currentSegment.text}</p>
+        </div>
+      ) : null}
+
+      <div className="grid grid-cols-[48px_48px_48px_48px_48px] items-center gap-2 md:flex md:flex-wrap">
+        <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" onClick={onPrevious} disabled={!mediaAvailable || !hasSegments || !canPrevious} aria-label="上一句">
+          <SkipBack size={16} />
+          <span className="hidden md:inline">上一句</span>
+        </Button>
+        <Button className="h-10 w-full rounded-full px-0 md:w-auto md:px-4" variant="primary" type="button" onClick={onTogglePlay} disabled={!mediaAvailable} aria-label={isPlaying ? '暂停' : '播放'}>
+          {isPlaying ? <Pause size={16} /> : <Play size={16} />}
+          <span className="hidden md:inline">{isPlaying ? '暂停' : '播放'}</span>
+        </Button>
+        <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" onClick={onNext} disabled={!mediaAvailable || !hasSegments || !canNext} aria-label="下一句">
+          <span className="hidden md:inline">下一句</span>
+          <SkipForward size={16} />
+        </Button>
+        <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" variant={loop ? 'primary' : 'secondary'} onClick={onToggleLoop} disabled={!loop && !canLoopCurrent} aria-label={loop ? '循环当前句' : '不循环'}>
+          <Repeat size={16} />
+          <span className="hidden md:inline">{loop ? '循环当前句' : '不循环'}</span>
+        </Button>
+        <Select className="w-full md:w-20" value={speed} onChange={(event) => onSpeedChange(Number(event.target.value))} aria-label="播放速度">
+          {speeds.map((value) => (
+            <option key={value} value={value}>
+              {value}x
+            </option>
+          ))}
+        </Select>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const detailRef = useRef<ClipDetail | null>(null)
   const selectedClipIntentIdRef = useRef<string | null>(null)
@@ -36,6 +141,9 @@ function App() {
   const listRequestIdRef = useRef(0)
   const foregroundListInFlightRef = useRef(0)
   const pollInFlightRef = useRef(false)
+  const activeMediaRef = useRef<MediaTarget>('audio')
+  const currentTimeRef = useRef(0)
+  const shouldAutoplayVideoRef = useRef(false)
   const activeClipQueryRef = useRef<{ query: string; filter: ClipFilter }>({ query: '', filter: 'all' })
   const [clips, setClips] = useState<Clip[]>([])
   const [clipTotal, setClipTotal] = useState(0)
@@ -52,6 +160,7 @@ function App() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [isPlaying, setIsPlaying] = useState(false)
+  const [activeMedia, setActiveMedia] = useState<MediaTarget>('audio')
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
   const [videoClip, setVideoClip] = useState<Clip | null>(null)
   const [videoError, setVideoError] = useState('')
@@ -82,9 +191,8 @@ function App() {
   }, [clipFilter, clipQuery])
 
   useEffect(() => {
-    if (audioRef.current) {
-      audioRef.current.playbackRate = speed
-    }
+    if (audioRef.current) audioRef.current.playbackRate = speed
+    if (videoRef.current) videoRef.current.playbackRate = speed
   }, [speed])
 
   useEffect(() => {
@@ -93,7 +201,7 @@ function App() {
     }
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
-        setVideoClip(null)
+        closeVideo()
       }
     }
     window.addEventListener('keydown', handleKeyDown)
@@ -115,10 +223,14 @@ function App() {
   }, [clipCounts.processing, detail?.clip.id, detail?.clip.status, isClipSearchLoading, isLoadingMoreClips])
 
   const playbackIndex = findSegmentIndex(segments, currentTime)
-  const currentIndex = playbackIndex ?? selectedIndex
-  const currentSegment = currentIndex === null ? null : segments[currentIndex] ?? null
-  const loopSegment = selectedIndex === null ? currentSegment : segments[selectedIndex] ?? currentSegment
+  const activeIndex = playbackIndex
+  const navigationIndex = playbackIndex ?? selectedIndex
+  const currentSegment = activeIndex === null ? null : segments[activeIndex] ?? null
+  const loopSegment = selectedIndex === null ? null : segments[selectedIndex] ?? null
   const totalSegments = segments.length
+  const canLoopCurrent = playbackIndex !== null
+  const canPreviousSegment = navigationIndex !== null && navigationIndex > 0
+  const canNextSegment = navigationIndex !== null && navigationIndex < segments.length - 1
   const readyClips = clipCounts.ready
   const hasMoreClips = clips.length < clipTotal
 
@@ -252,10 +364,10 @@ function App() {
     }
   }
 
-  async function openClip(id: string) {
+  async function openClip(id: string): Promise<ClipDetail | null> {
     const requestId = ++openRequestIdRef.current
     selectedClipIntentIdRef.current = id
-    setVideoClip(null)
+    resetToAudioMedia()
     setOpeningId(id)
     setError('')
     setNotice('')
@@ -263,14 +375,16 @@ function App() {
     try {
       const next = normalizeDetail(await getClip(id))
       if (requestId !== openRequestIdRef.current) {
-        return
+        return null
       }
       applyDetail(next, false)
+      return next
     } catch (err) {
       if (requestId === openRequestIdRef.current) {
         selectedClipIntentIdRef.current = detailRef.current?.clip.id ?? null
         setError(errorMessage(err))
       }
+      return null
     } finally {
       if (requestId === openRequestIdRef.current) {
         setOpeningId(null)
@@ -344,7 +458,7 @@ function App() {
       return
     }
 
-    setVideoClip(null)
+    resetToAudioMedia()
     const isDeletingCurrentClip = detail?.clip.id === clip.id
     setBusy(`delete-${clip.id}`)
     setError('')
@@ -355,7 +469,7 @@ function App() {
       if (isDeletingCurrentClip) {
         openRequestIdRef.current += 1
         setOpeningId(null)
-        audioRef.current?.pause()
+        resetToAudioMedia()
         detailRef.current = null
         selectedClipIntentIdRef.current = null
         setDetail(null)
@@ -411,8 +525,7 @@ function App() {
       openRequestIdRef.current += 1
       setOpeningId(null)
     }
-    setVideoClip(null)
-    audioRef.current?.pause()
+    resetToAudioMedia()
     detailRef.current = next
     selectedClipIntentIdRef.current = next.clip.id
     setDetail(next)
@@ -421,85 +534,238 @@ function App() {
     resetPlaybackState()
   }
 
+  async function openVideo(clip: Clip) {
+    setOpenMenuId(null)
+    setVideoError('')
+    const isCurrentClip = detailRef.current?.clip.id === clip.id
+    let nextDetail = detailRef.current
+    if (!isCurrentClip) {
+      nextDetail = await openClip(clip.id)
+    }
+    if (!nextDetail || nextDetail.clip.id !== clip.id) {
+      return
+    }
+
+    const outgoingMedia = isCurrentClip ? getActiveMediaElement() : null
+    const startTime = outgoingMedia && Number.isFinite(outgoingMedia.currentTime) ? outgoingMedia.currentTime : currentTimeRef.current
+    setActiveMediaTarget('video')
+    stopAllMedia()
+    updatePlaybackTime(startTime)
+    setDuration(nextDetail.clip.duration || 0)
+    shouldAutoplayVideoRef.current = true
+    setVideoClip(nextDetail.clip)
+  }
+
+  function closeVideo() {
+    const video = videoRef.current
+    const nextTime = video && Number.isFinite(video.currentTime) ? video.currentTime : currentTimeRef.current
+    shouldAutoplayVideoRef.current = false
+    setActiveMediaTarget('audio')
+    video?.pause()
+    audioRef.current?.pause()
+    setVideoClip(null)
+    setVideoError('')
+    setIsPlaying(false)
+    let syncedTime = nextTime
+    const audio = audioRef.current
+    if (audio) {
+      const audioDuration = Number.isFinite(audio.duration) ? audio.duration : detailRef.current?.clip.duration || 0
+      syncedTime = clampMediaTime(nextTime, audioDuration)
+      audio.currentTime = syncedTime
+      setDuration(audioDuration)
+    }
+    updatePlaybackTime(syncedTime)
+    const syncedIndex = findSegmentIndex(segments, syncedTime)
+    if (syncedIndex !== null) {
+      setSelectedIndex(syncedIndex)
+    } else if (loop) {
+      setLoop(false)
+    }
+  }
+
+  function resetToAudioMedia() {
+    shouldAutoplayVideoRef.current = false
+    setActiveMediaTarget('audio')
+    stopAllMedia()
+    setVideoClip(null)
+    setVideoError('')
+  }
+
+  function setActiveMediaTarget(target: MediaTarget) {
+    activeMediaRef.current = target
+    setActiveMedia(target)
+  }
+
+  function getMediaElement(target: MediaTarget) {
+    return target === 'video' ? videoRef.current : audioRef.current
+  }
+
+  function getActiveMediaElement() {
+    return getMediaElement(activeMediaRef.current)
+  }
+
+  function isActiveMediaElement(target: MediaTarget, media: HTMLMediaElement) {
+    return activeMediaRef.current === target && getMediaElement(target) === media
+  }
+
+  function stopAllMedia() {
+    audioRef.current?.pause()
+    videoRef.current?.pause()
+    setIsPlaying(false)
+  }
+
+  async function requestMediaPlay(target: MediaTarget, media: HTMLMediaElement) {
+    if (!isActiveMediaElement(target, media)) {
+      return
+    }
+    const otherTarget: MediaTarget = target === 'audio' ? 'video' : 'audio'
+    getMediaElement(otherTarget)?.pause()
+    try {
+      await media.play()
+      if (!isActiveMediaElement(target, media)) {
+        media.pause()
+      }
+    } catch {
+      if (isActiveMediaElement(target, media)) {
+        setIsPlaying(false)
+      }
+    }
+  }
+
+  function updatePlaybackTime(value: number) {
+    const safeValue = Number.isFinite(value) ? Math.max(0, value) : 0
+    currentTimeRef.current = safeValue
+    setCurrentTime(safeValue)
+  }
+
   function playSegment(index: number) {
     const segment = segments[index]
-    const audio = audioRef.current
-    if (!segment || !audio) {
+    const media = getActiveMediaElement()
+    if (!segment || !media) {
       return
     }
     setSelectedIndex(index)
-    audio.currentTime = segment.start
-    setCurrentTime(segment.start)
-    void audio.play()
+    media.currentTime = segment.start
+    updatePlaybackTime(segment.start)
+    void requestMediaPlay(activeMediaRef.current, media)
   }
 
   function previousSegment() {
-    if (!detail || segments.length === 0) {
+    if (!canPreviousSegment || navigationIndex === null) {
       return
     }
-    const nextIndex = Math.max(0, (currentIndex ?? 0) - 1)
-    playSegment(nextIndex)
+    playSegment(navigationIndex - 1)
   }
 
   function nextSegment() {
-    if (!detail || segments.length === 0) {
+    if (!canNextSegment || navigationIndex === null) {
       return
     }
-    const nextIndex = Math.min(segments.length - 1, (currentIndex ?? 0) + 1)
-    playSegment(nextIndex)
+    playSegment(navigationIndex + 1)
+  }
+
+  function toggleLoop() {
+    if (!loop) {
+      if (playbackIndex === null) {
+        return
+      }
+      setSelectedIndex(playbackIndex)
+      setLoop(true)
+      return
+    }
+    setLoop(false)
   }
 
   function togglePlay() {
-    const audio = audioRef.current
-    if (!audio) {
+    const target = activeMediaRef.current
+    const media = getMediaElement(target)
+    if (!media) {
       return
     }
-    if (audio.paused) {
-      void audio.play()
+    if (media.paused) {
+      void requestMediaPlay(target, media)
     } else {
-      audio.pause()
+      media.pause()
     }
   }
 
-  function handleTimeUpdate() {
-    const audio = audioRef.current
-    if (!audio || !detail) {
+  function handleMediaTimeUpdate(target: MediaTarget, media: HTMLMediaElement) {
+    if (!isActiveMediaElement(target, media) || !detailRef.current) {
       return
     }
-    const current = audio.currentTime
-    if (loop && loopSegment && current >= loopSegment.end) {
-      audio.currentTime = loopSegment.start
-      setCurrentTime(loopSegment.start)
-      void audio.play()
+    const nextTime = media.currentTime
+    if (loop && loopSegment && nextTime >= loopSegment.end - 0.02) {
+      media.currentTime = loopSegment.start
+      updatePlaybackTime(loopSegment.start)
+      void requestMediaPlay(target, media)
       return
     }
-
-    setCurrentTime(current)
+    updatePlaybackTime(nextTime)
   }
 
-  function handleLoadedMetadata() {
-    const audio = audioRef.current
-    if (!audio) {
+  function handleMediaLoadedMetadata(target: MediaTarget, media: HTMLMediaElement) {
+    media.playbackRate = speed
+    if (!isActiveMediaElement(target, media)) {
       return
     }
-    setDuration(Number.isFinite(audio.duration) ? audio.duration : 0)
-    setCurrentTime(audio.currentTime)
+    const nextDuration = Number.isFinite(media.duration) ? media.duration : detailRef.current?.clip.duration || 0
+    const nextTime = clampMediaTime(currentTimeRef.current, nextDuration)
+    media.currentTime = nextTime
+    setDuration(nextDuration)
+    updatePlaybackTime(nextTime)
+    if (target === 'video' && shouldAutoplayVideoRef.current) {
+      shouldAutoplayVideoRef.current = false
+      void requestMediaPlay(target, media)
+    }
+  }
+
+  function handleMediaPlay(target: MediaTarget, media: HTMLMediaElement) {
+    if (!isActiveMediaElement(target, media)) {
+      media.pause()
+      return
+    }
+    const otherTarget: MediaTarget = target === 'audio' ? 'video' : 'audio'
+    getMediaElement(otherTarget)?.pause()
+    setIsPlaying(true)
+  }
+
+  function handleMediaPause(target: MediaTarget, media: HTMLMediaElement) {
+    if (isActiveMediaElement(target, media)) {
+      setIsPlaying(false)
+    }
+  }
+
+  function handleMediaEnded(target: MediaTarget, media: HTMLMediaElement) {
+    if (!isActiveMediaElement(target, media)) {
+      return
+    }
+    if (loop && loopSegment) {
+      media.currentTime = loopSegment.start
+      updatePlaybackTime(loopSegment.start)
+      void requestMediaPlay(target, media)
+      return
+    }
+    setIsPlaying(false)
   }
 
   function handleSeek(value: number) {
-    const audio = audioRef.current
-    if (!audio) {
+    const media = getActiveMediaElement()
+    if (!media) {
       return
     }
-    audio.currentTime = value
-    setCurrentTime(value)
-    const index = findSegmentIndex(segments, value)
-    if (index !== null) {
-      setSelectedIndex(index)
+    const nextValue = clampMediaTime(value, Number.isFinite(media.duration) ? media.duration : effectiveDuration)
+    media.currentTime = nextValue
+    updatePlaybackTime(nextValue)
+    const nextIndex = findSegmentIndex(segments, nextValue)
+    if (nextIndex !== null) {
+      setSelectedIndex(nextIndex)
+    } else if (loop) {
+      setLoop(false)
     }
   }
 
   function resetPlaybackState() {
+    currentTimeRef.current = 0
     setCurrentTime(0)
     setDuration(0)
   }
@@ -654,12 +920,7 @@ function App() {
                             className="h-8 w-8 px-0"
                             variant="ghost"
                             type="button"
-                            onClick={() => {
-                              audioRef.current?.pause()
-                              setOpenMenuId(null)
-                              setVideoError('')
-                              setVideoClip(clip)
-                            }}
+                            onClick={() => void openVideo(clip)}
                             aria-label={`播放“${clip.title}”原视频`}
                           >
                             <Video size={15} />
@@ -747,75 +1008,38 @@ function App() {
                 <p className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800">{detail.clip.error}</p>
               ) : null}
               <audio
+                key={audioSource}
                 ref={audioRef}
                 className="hidden"
-                src={audioSource}
+                src={audioSource || undefined}
                 preload="metadata"
-                onLoadedMetadata={handleLoadedMetadata}
-                onTimeUpdate={handleTimeUpdate}
-                onPlay={() => setIsPlaying(true)}
-                onPause={() => setIsPlaying(false)}
-                onEnded={() => setIsPlaying(false)}
+                onLoadedMetadata={(event) => handleMediaLoadedMetadata('audio', event.currentTarget)}
+                onTimeUpdate={(event) => handleMediaTimeUpdate('audio', event.currentTarget)}
+                onPlay={(event) => handleMediaPlay('audio', event.currentTarget)}
+                onPause={(event) => handleMediaPause('audio', event.currentTarget)}
+                onEnded={(event) => handleMediaEnded('audio', event.currentTarget)}
+                onError={() => setError('音频加载失败，请稍后重试。')}
               />
-              <div className="grid gap-3 rounded-lg bg-slate-50/90 p-3 sm:p-4">
-                <div className="grid min-w-0 gap-1.5">
-                  <div className="flex items-center justify-between gap-3 text-xs font-semibold text-muted">
-                    <span className="font-mono">{formatTime(seekValue)}</span>
-                    <span className="font-mono">{formatTime(effectiveDuration)}</span>
-                  </div>
-                  <input
-                    className="player-range"
-                    type="range"
-                    min={0}
-                    max={Math.max(effectiveDuration, 0)}
-                    step={0.05}
-                    value={seekValue}
-                    onChange={(event) => handleSeek(Number(event.target.value))}
-                    disabled={!audioSource || effectiveDuration <= 0}
-                    style={{
-                      background: `linear-gradient(to right, #0f766e 0%, #0f766e ${progressPercent}%, #cbd5e1 ${progressPercent}%, #cbd5e1 100%)`
-                    }}
-                    aria-label="播放进度"
-                  />
-                </div>
-
-                {currentSegment ? (
-                  <div className="rounded-md border border-teal-100 bg-white px-3 py-2.5 sm:px-4 sm:py-3">
-                    <p className="text-base font-semibold leading-7 text-slate-950">{currentSegment.text}</p>
-                  </div>
-                ) : null}
-
-                <div className="grid grid-cols-[48px_48px_48px_48px_48px] items-center gap-2 md:flex md:flex-wrap">
-                  <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" onClick={previousSegment} disabled={!audioSource || segments.length === 0} aria-label="上一句">
-                    <SkipBack size={16} />
-                    <span className="hidden md:inline">上一句</span>
-                  </Button>
-                  <Button className="h-10 w-full rounded-full px-0 md:w-auto md:px-4" variant="primary" type="button" onClick={togglePlay} disabled={!audioSource} aria-label={isPlaying ? '暂停' : '播放'}>
-                    {isPlaying ? <Pause size={16} /> : <Play size={16} />}
-                    <span className="hidden md:inline">{isPlaying ? '暂停' : '播放'}</span>
-                  </Button>
-                  <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" onClick={nextSegment} disabled={!audioSource || segments.length === 0} aria-label="下一句">
-                    <span className="hidden md:inline">下一句</span>
-                    <SkipForward size={16} />
-                  </Button>
-                  <Button className="h-10 w-full px-0 md:w-auto md:px-4" type="button" variant={loop ? 'primary' : 'secondary'} onClick={() => setLoop(!loop)} aria-label={loop ? '循环当前句' : '不循环'}>
-                    <Repeat size={16} />
-                    <span className="hidden md:inline">{loop ? '循环当前句' : '不循环'}</span>
-                  </Button>
-                  <Select
-                    className="w-full md:w-20"
-                    value={speed}
-                    onChange={(event) => setSpeed(Number(event.target.value))}
-                    aria-label="播放速度"
-                  >
-                    {speeds.map((value) => (
-                      <option key={value} value={value}>
-                        {value}x
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-              </div>
+              <PlaybackPanel
+                currentTime={seekValue}
+                duration={effectiveDuration}
+                progressPercent={progressPercent}
+                currentSegment={currentSegment}
+                isPlaying={isPlaying}
+                loop={loop}
+                speed={speed}
+                mediaAvailable={Boolean(audioSource) && activeMedia === 'audio'}
+                hasSegments={segments.length > 0}
+                canPrevious={canPreviousSegment}
+                canNext={canNextSegment}
+                canLoopCurrent={canLoopCurrent}
+                onSeek={handleSeek}
+                onPrevious={previousSegment}
+                onTogglePlay={togglePlay}
+                onNext={nextSegment}
+                onToggleLoop={toggleLoop}
+                onSpeedChange={setSpeed}
+              />
             </CardBody>
           </Card>
 
@@ -836,12 +1060,12 @@ function App() {
                       type="button"
                       className={cn(
                         'grid w-full grid-cols-[76px_minmax(0,1fr)] items-start gap-4 px-4 py-4 text-left transition sm:grid-cols-[92px_minmax(0,1fr)] sm:px-5',
-                        currentIndex === index ? 'bg-teal-50' : 'hover:bg-slate-50'
+                        activeIndex === index ? 'bg-teal-50' : 'hover:bg-slate-50'
                       )}
                       onClick={() => playSegment(index)}
                     >
                       <span className="pt-1 font-mono text-xs font-semibold tabular-nums text-muted">{formatTime(segment.start)}</span>
-                      <span className={cn('min-w-0 text-base leading-7', currentIndex === index ? 'font-semibold text-primary' : 'text-slate-800')}>
+                      <span className={cn('min-w-0 text-base leading-7', activeIndex === index ? 'font-semibold text-primary' : 'text-slate-800')}>
                         {segment.text}
                       </span>
                     </button>
@@ -854,11 +1078,11 @@ function App() {
       </div>
       {videoClip ? (
         <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
-          onClick={() => setVideoClip(null)}
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/80 p-2 backdrop-blur-sm sm:p-4"
+          onClick={closeVideo}
         >
           <section
-            className="grid max-h-[calc(100vh-2rem)] w-full max-w-5xl gap-3 overflow-hidden rounded-lg border border-white/10 bg-slate-950 p-3 shadow-2xl sm:p-4"
+            className="grid max-h-[calc(100vh-1rem)] w-full max-w-6xl grid-rows-[auto_minmax(0,1fr)] gap-3 overflow-hidden rounded-xl border border-white/10 bg-slate-950 p-3 shadow-2xl sm:max-h-[calc(100vh-2rem)] sm:gap-4 sm:p-4"
             role="dialog"
             aria-modal="true"
             aria-labelledby="source-video-title"
@@ -871,26 +1095,73 @@ function App() {
               <button
                 className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-white/20 bg-white/10 text-white transition hover:bg-white/20"
                 type="button"
-                onClick={() => setVideoClip(null)}
+                onClick={closeVideo}
                 aria-label={`关闭“${videoClip.title}”原视频`}
               >
                 <X size={18} />
               </button>
             </div>
-            <video
-              className="max-h-[calc(100vh-7rem)] w-full rounded-md bg-black"
-              src={`/api/clips/${videoClip.id}/source`}
-              controls
-              autoPlay
-              playsInline
-              onLoadedData={() => setVideoError('')}
-              onError={() => setVideoError('原视频加载失败，请确认文件格式受浏览器支持后重试。')}
-            />
-            {videoError ? (
-              <p className="rounded-md bg-red-950/70 px-3 py-2 text-sm text-red-100" role="alert">
-                {videoError}
-              </p>
-            ) : null}
+            <div className="min-h-0 overflow-y-auto">
+              <div className="grid content-start gap-3">
+                <button
+                  className="group relative flex min-h-[220px] w-full items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black sm:min-h-[360px] lg:min-h-0 lg:aspect-video"
+                  type="button"
+                  onClick={togglePlay}
+                  aria-label={isPlaying ? '暂停原视频' : '播放原视频'}
+                >
+                  <video
+                    key={videoClip.id}
+                    ref={videoRef}
+                    className="pointer-events-none h-full max-h-[58vh] w-full object-contain"
+                    src={`/api/clips/${videoClip.id}/source`}
+                    playsInline
+                    onLoadedMetadata={(event) => handleMediaLoadedMetadata('video', event.currentTarget)}
+                    onTimeUpdate={(event) => handleMediaTimeUpdate('video', event.currentTarget)}
+                    onPlay={(event) => handleMediaPlay('video', event.currentTarget)}
+                    onPause={(event) => handleMediaPause('video', event.currentTarget)}
+                    onEnded={(event) => handleMediaEnded('video', event.currentTarget)}
+                    onLoadedData={() => setVideoError('')}
+                    onError={() => {
+                      setIsPlaying(false)
+                      setVideoError('原视频加载失败，请确认文件格式受浏览器支持后重试。')
+                    }}
+                  />
+                  {!isPlaying ? (
+                    <span className="absolute inset-0 flex items-center justify-center bg-black/10 transition group-hover:bg-black/20">
+                      <span className="inline-flex h-16 w-16 items-center justify-center rounded-full bg-white/90 text-slate-950 shadow-xl">
+                        <Play className="ml-1" size={28} />
+                      </span>
+                    </span>
+                  ) : null}
+                </button>
+                {videoError ? (
+                  <p className="rounded-md bg-red-950/70 px-3 py-2 text-sm text-red-100" role="alert">
+                    {videoError}
+                  </p>
+                ) : null}
+                <PlaybackPanel
+                  dark
+                  currentTime={seekValue}
+                  duration={effectiveDuration}
+                  progressPercent={progressPercent}
+                  currentSegment={currentSegment}
+                  isPlaying={isPlaying}
+                  loop={loop}
+                  speed={speed}
+                  mediaAvailable={activeMedia === 'video'}
+                  hasSegments={segments.length > 0}
+                  canPrevious={canPreviousSegment}
+                  canNext={canNextSegment}
+                  canLoopCurrent={canLoopCurrent}
+                  onSeek={handleSeek}
+                  onPrevious={previousSegment}
+                  onTogglePlay={togglePlay}
+                  onNext={nextSegment}
+                  onToggleLoop={toggleLoop}
+                  onSpeedChange={setSpeed}
+                />
+              </div>
+            </div>
           </section>
         </div>
       ) : null}
@@ -921,6 +1192,16 @@ function findSegmentIndex(segments: ClipDetail['segments'], time: number) {
   }
   const index = segments.findIndex((segment) => time >= segment.start && time < segment.end)
   return index === -1 ? null : index
+}
+
+function clampMediaTime(value: number, duration: number) {
+  if (!Number.isFinite(value)) {
+    return 0
+  }
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return Math.max(0, value)
+  }
+  return Math.min(Math.max(0, value), duration)
 }
 
 function normalizeDetail(detail: ClipDetail): ClipDetail {
