@@ -254,12 +254,25 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(parts) == 2 && parts[1] == "source" {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+			return
+		}
+		s.handleSource(w, r, clipID)
+		return
+	}
+
 	if len(parts) == 2 && parts[1] == "reprocess" {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w)
 			return
 		}
 		s.handleReprocess(w, r, clipID)
+		return
+	}
+	if len(parts) != 1 {
+		http.NotFound(w, r)
 		return
 	}
 
@@ -377,6 +390,36 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request, clipID stri
 		return
 	}
 	http.ServeFile(w, r, clip.AudioPath)
+}
+
+func (s *Server) handleSource(w http.ResponseWriter, r *http.Request, clipID string) {
+	clip, _, err := s.store.GetClip(r.Context(), clipID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, errors.New("clip not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if clip.SourcePath == "" {
+		writeError(w, http.StatusNotFound, errors.New("clip source is missing"))
+		return
+	}
+	info, err := os.Stat(clip.SourcePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, errors.New("clip source not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if info.IsDir() {
+		writeError(w, http.StatusNotFound, errors.New("clip source not found"))
+		return
+	}
+	http.ServeFile(w, r, clip.SourcePath)
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {

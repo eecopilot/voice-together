@@ -141,6 +141,93 @@ func TestDeleteMissingClipReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestClipSourceEndpoint(t *testing.T) {
+	server, store, paths := newTestServer(t, fakeMediaProcessor{}, fakeTranscriber{})
+	sourcePath := filepath.Join(paths.UploadsDir, "stream.mp3")
+	if err := os.WriteFile(sourcePath, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	createSourceClip(t, store, "stream", sourcePath)
+
+	t.Run("success", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/api/clips/stream/source", nil)
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+		}
+		if response.Body.String() != "0123456789" {
+			t.Fatalf("body = %q, want source content", response.Body.String())
+		}
+		if response.Header().Get("Content-Type") == "" {
+			t.Fatal("Content-Type header is missing")
+		}
+	})
+
+	t.Run("range", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/api/clips/stream/source", nil)
+		request.Header.Set("Range", "bytes=2-5")
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusPartialContent {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusPartialContent, response.Body.String())
+		}
+		if response.Body.String() != "2345" {
+			t.Fatalf("body = %q, want %q", response.Body.String(), "2345")
+		}
+		if got := response.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+			t.Fatalf("Content-Range = %q, want %q", got, "bytes 2-5/10")
+		}
+	})
+
+	t.Run("missing clip", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/api/clips/missing/source", nil)
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusNotFound, response.Body.String())
+		}
+	})
+
+	t.Run("missing source path", func(t *testing.T) {
+		createSourceClip(t, store, "empty-source", "")
+		request := httptest.NewRequest(http.MethodGet, "/api/clips/empty-source/source", nil)
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusNotFound, response.Body.String())
+		}
+	})
+
+	t.Run("missing source file", func(t *testing.T) {
+		createSourceClip(t, store, "missing-file", filepath.Join(paths.UploadsDir, "missing.mp3"))
+		request := httptest.NewRequest(http.MethodGet, "/api/clips/missing-file/source", nil)
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusNotFound, response.Body.String())
+		}
+	})
+
+	t.Run("wrong method", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodPost, "/api/clips/stream/source", nil)
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusMethodNotAllowed, response.Body.String())
+		}
+	})
+
+	t.Run("unknown child path", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/api/clips/stream/source/extra", nil)
+		response := httptest.NewRecorder()
+		server.Routes().ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusNotFound, response.Body.String())
+		}
+	})
+}
+
 func TestDemoImportEndpointIsNotExposed(t *testing.T) {
 	server, _, _ := newTestServer(t, fakeMediaProcessor{}, fakeTranscriber{})
 	request := httptest.NewRequest(http.MethodPost, "/api/demo/import", nil)
@@ -391,6 +478,19 @@ func seedClipList(t *testing.T, store *db.Store) {
 		if err := store.CreateClip(context.Background(), clip); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func createSourceClip(t *testing.T, store *db.Store, id string, sourcePath string) {
+	t.Helper()
+	if err := store.CreateClip(context.Background(), db.Clip{
+		ID:         id,
+		Title:      id,
+		SourcePath: sourcePath,
+		Status:     "ready",
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

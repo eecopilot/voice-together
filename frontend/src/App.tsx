@@ -1,5 +1,5 @@
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from 'react'
-import { Headphones, Loader2, MoreVertical, Pause, Play, RefreshCw, Repeat, Search, SkipBack, SkipForward, Trash2, Upload } from 'lucide-react'
+import { Headphones, Loader2, MoreVertical, Pause, Play, RefreshCw, Repeat, Search, SkipBack, SkipForward, Trash2, Upload, Video, X } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Card, CardBody, CardHeader } from './components/ui/card'
 import { Select } from './components/ui/select'
@@ -45,6 +45,8 @@ function App() {
   const [notice, setNotice] = useState('')
   const [isPlaying, setIsPlaying] = useState(false)
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
+  const [videoClip, setVideoClip] = useState<Clip | null>(null)
+  const [videoError, setVideoError] = useState('')
   const [clipQuery, setClipQuery] = useState('')
   const [clipFilter, setClipFilter] = useState<ClipFilter>('all')
   const [isClipSearchLoading, setIsClipSearchLoading] = useState(true)
@@ -76,6 +78,19 @@ function App() {
       audioRef.current.playbackRate = speed
     }
   }, [speed])
+
+  useEffect(() => {
+    if (!videoClip) {
+      return
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setVideoClip(null)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [videoClip])
 
   const playbackIndex = findSegmentIndex(segments, currentTime)
   const currentIndex = playbackIndex ?? selectedIndex
@@ -140,6 +155,7 @@ function App() {
 
   async function openClip(id: string) {
     const requestId = ++openRequestIdRef.current
+    setVideoClip(null)
     setOpeningId(id)
     setError('')
     setNotice('')
@@ -210,6 +226,7 @@ function App() {
       return
     }
 
+    setVideoClip(null)
     const isDeletingCurrentClip = detail?.clip.id === clip.id
     setBusy(`delete-${clip.id}`)
     setError('')
@@ -261,6 +278,7 @@ function App() {
       openRequestIdRef.current += 1
       setOpeningId(null)
     }
+    setVideoClip(null)
     audioRef.current?.pause()
     setDetail(next)
     setSelectedIndex(next.segments.length > 0 ? 0 : null)
@@ -482,7 +500,23 @@ function App() {
                           <span className="truncate">{formatClipDate(clip.created_at)}</span>
                         </span>
                       </button>
-                      <div className="flex items-start">
+                      <div className="flex items-start gap-1">
+                        {isVideoSource(clip.source_path) ? (
+                          <Button
+                            className="h-8 w-8 px-0"
+                            variant="ghost"
+                            type="button"
+                            onClick={() => {
+                              audioRef.current?.pause()
+                              setOpenMenuId(null)
+                              setVideoError('')
+                              setVideoClip(clip)
+                            }}
+                            aria-label={`播放“${clip.title}”原视频`}
+                          >
+                            <Video size={15} />
+                          </Button>
+                        ) : null}
                         <Button
                           className="h-8 w-8 px-0"
                           variant="ghost"
@@ -670,6 +704,48 @@ function App() {
           </Card>
         </section>
       </div>
+      {videoClip ? (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
+          onClick={() => setVideoClip(null)}
+        >
+          <section
+            className="grid max-h-[calc(100vh-2rem)] w-full max-w-5xl gap-3 overflow-hidden rounded-lg border border-white/10 bg-slate-950 p-3 shadow-2xl sm:p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="source-video-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex min-w-0 items-center justify-between gap-3 text-white">
+              <h2 id="source-video-title" className="truncate text-base font-bold sm:text-lg">
+                {videoClip.title}
+              </h2>
+              <button
+                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-white/20 bg-white/10 text-white transition hover:bg-white/20"
+                type="button"
+                onClick={() => setVideoClip(null)}
+                aria-label={`关闭“${videoClip.title}”原视频`}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <video
+              className="max-h-[calc(100vh-7rem)] w-full rounded-md bg-black"
+              src={`/api/clips/${videoClip.id}/source`}
+              controls
+              autoPlay
+              playsInline
+              onLoadedData={() => setVideoError('')}
+              onError={() => setVideoError('原视频加载失败，请确认文件格式受浏览器支持后重试。')}
+            />
+            {videoError ? (
+              <p className="rounded-md bg-red-950/70 px-3 py-2 text-sm text-red-100" role="alert">
+                {videoError}
+              </p>
+            ) : null}
+          </section>
+        </div>
+      ) : null}
     </main>
   )
 }
@@ -709,6 +785,11 @@ function normalizeDetail(detail: ClipDetail): ClipDetail {
 function appendUniqueClips(current: Clip[], next: Clip[]) {
   const existingIds = new Set(current.map((clip) => clip.id))
   return [...current, ...next.filter((clip) => !existingIds.has(clip.id))]
+}
+
+function isVideoSource(sourcePath: string) {
+  const cleanPath = sourcePath.split(/[?#]/, 1)[0]
+  return /\.(mp4|mov|m4v|webm|mkv)$/i.test(cleanPath)
 }
 
 export default App
